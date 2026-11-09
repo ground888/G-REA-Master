@@ -721,7 +721,7 @@ const builtinProvenanceOrigin = (
     : undefined;
 };
 
-const affectsBuiltinPath = (
+export const affectsBuiltinPath = (
   path: JavaScriptSemanticPropertyPath,
   selected: readonly string[],
 ): boolean =>

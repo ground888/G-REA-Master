@@ -114,6 +114,54 @@ it.each([
     "Object.getPrototypeOf = () => Map.prototype; Object.getPrototypeOf({}).get = fetch; new Map().get('/accounts');",
     true,
   ],
+  [
+    "const records = new Map(); records.get('/accounts'); const other = new Map(); consume(other);",
+    false,
+  ],
+  [
+    "const records = new Map(); records.delete('/accounts'); const other = new Map(); consume(other);",
+    false,
+  ],
+  [
+    "const records = new Map(); const other = new Map(); consume(other); records.get('/accounts');",
+    true,
+  ],
+  [
+    "const records = new Map(); const other = new Map(); consume(other); records.delete('/accounts');",
+    true,
+  ],
+  [
+    "const records = new Map(); records.get('/accounts'); Map.prototype.get = fetch;",
+    false,
+  ],
+  [
+    "const records = new Map(); Map.prototype.get = fetch; records.get('/accounts');",
+    true,
+  ],
+  [
+    "const records = new Map(); records.get('/accounts'); consume(Map.prototype);",
+    false,
+  ],
+  [
+    "const records = new Map(); consume(Map.prototype); records.get('/accounts');",
+    true,
+  ],
+  [
+    "const records = new Map([['x', 1]]); Map.prototype.set = replacement; records.get('/accounts');",
+    false,
+  ],
+  [
+    "Map.prototype.set = replacement; const records = new Map([['x', 1]]); records.get('/accounts');",
+    true,
+  ],
+  [
+    "const records = new Map(); function later() { consume(Map.prototype); } records.get('/accounts');",
+    true,
+  ],
+  [
+    "const records = new Map((Map.prototype.set = function () { this.get = fetch; return this; }, [['x', 1]])); records.get('/accounts');",
+    true,
+  ],
   ["client.get('/accounts');", true],
   ["eval('Map.prototype.get = fetch'); new Map().get('/accounts');", true],
 ] as const)(
@@ -2213,3 +2261,51 @@ it.each([
     );
   },
 );
+
+it.each([
+  [
+    "an unchanged function-local receiver",
+    "function run(){const xhr=new XMLHttpRequest();xhr.open('GET','/xhr');}",
+    true,
+  ],
+  [
+    "an earlier constructor escape",
+    "const xhr=new XMLHttpRequest();mutate(xhr.constructor);xhr.open('GET','/xhr');",
+    false,
+  ],
+  [
+    "an earlier cross-instance escape",
+    "const other=new XMLHttpRequest();const xhr=new XMLHttpRequest();mutate(other);xhr.open('GET','/xhr');",
+    false,
+  ],
+  [
+    "a later constructor escape",
+    "const xhr=new XMLHttpRequest();xhr.open('GET','/xhr');mutate(xhr.constructor);",
+    true,
+  ],
+  [
+    "a later cross-instance escape",
+    "const other=new XMLHttpRequest();const xhr=new XMLHttpRequest();xhr.open('GET','/xhr');mutate(other);",
+    true,
+  ],
+  [
+    "an escaped method value",
+    "const xhr=new XMLHttpRequest();mutate(XMLHttpRequest.prototype.open);xhr.open('GET','/xhr');",
+    true,
+  ],
+  [
+    "a shared escape in a possibly repeated activation",
+    "const other=new XMLHttpRequest();function run(){const xhr=new XMLHttpRequest();xhr.open('GET','/xhr');mutate(other);}",
+    false,
+  ],
+])("orders XHR method selection against %s", (_label, source, observed) => {
+  const result = analyzeWebBundleFixture(inspection(source));
+  expect(result.observations.endpoints.map(({ value }) => value)).toEqual(
+    observed ? ["/xhr"] : [],
+  );
+  expect(
+    result.inferences
+      .filter(({ kind }) => kind === "endpoint_candidate")
+      .map(({ value }) => value),
+  ).toEqual(observed ? [] : ["/xhr"]);
+});

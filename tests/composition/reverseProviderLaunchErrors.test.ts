@@ -434,6 +434,11 @@ it("preserves Darwin process ownership inspection error with cleanup state witho
         resources: ["/tmp/helper"],
       });
     }
+    // The helper's cleanup stays retained, and close retries it, until it
+    // resolves.
+    expect((await service.retryCleanup()).ok).toBe(false);
+    cleanupError.resolveCleanup();
+    expect(await service.retryCleanup()).toEqual({ ok: true, value: null });
     expect(service.observedLaunchFailures()).toEqual({});
   } finally {
     prepareSpy.mockRestore();
@@ -493,6 +498,11 @@ it("preserves command deadline timeout when macOS helper preparation aborts and 
         resources: ["/tmp/helper"],
       });
     }
+    // The helper's cleanup stays retained, and close retries it, until it
+    // resolves.
+    expect((await service.retryCleanup()).ok).toBe(false);
+    cleanupError.resolveCleanup();
+    expect(await service.retryCleanup()).toEqual({ ok: true, value: null });
     expect(service.observedLaunchFailures()).toEqual({});
   } finally {
     await service.close();

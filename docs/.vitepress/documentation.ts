@@ -48,6 +48,11 @@ export const documentationSections = [
         source: "guides/native/recorded-crashes.md",
         route: "/recorded-crashes",
       },
+      {
+        text: "PE Rich header",
+        source: "guides/native/pe-rich-header.md",
+        route: "/pe-rich-header",
+      },
     ],
   },
   {

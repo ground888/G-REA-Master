@@ -44,6 +44,11 @@ export const documentationSections = [
         route: "/binary-diagnostics",
       },
       {
+        text: "ELF separate debug files",
+        source: "guides/native/elf-debug-link.md",
+        route: "/elf-debug-link",
+      },
+      {
         text: "Recorded crash evidence",
         source: "guides/native/recorded-crashes.md",
         route: "/recorded-crashes",

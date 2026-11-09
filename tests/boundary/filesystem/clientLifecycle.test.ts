@@ -44,6 +44,9 @@ describe("client configuration filesystem lifecycle", () => {
     for (const client of supportedClients(home))
       if (client.markerPath !== undefined)
         await mkdir(client.markerPath, { recursive: true });
+    // Gemini CLI's applicability follows its own settings or runtime state,
+    // not the shared .gemini root the marker loop creates.
+    await mkdir(join(home, ".gemini", "tmp"), { recursive: true });
     const detected = await detectClients(home);
     expect(detected.map(({ name }) => name)).toEqual([
       "claude_code",
@@ -56,6 +59,7 @@ describe("client configuration filesystem lifecycle", () => {
       "devin",
       "opencode",
       "antigravity",
+      "antigravity_cli",
       "copilot_cli",
       "commandcode",
       "qwen_code",
@@ -1988,6 +1992,45 @@ describe("uninstall configuration preflight", () => {
 });
 
 describe("client configuration changed during uninstall", () => {
+  it("blocks purge when an owned config-only grouped registration becomes unreadable", async () => {
+    const home = await createTestTempDirectory("rea-uninstall-group-owned-");
+    const config = join(home, ".gemini/config/mcp_config.json");
+    await mkdir(dirname(config), { recursive: true });
+    const original = JSON.stringify({
+      mcpServers: {
+        rea: { command: PRODUCT_IDENTITY.cliBinary, args: ["mcp"] },
+      },
+    });
+    await writeFile(config, original);
+    const codex = join(home, ".codex/config.toml");
+    const codexConfig = `[mcp_servers.rea]\ncommand = "${PRODUCT_IDENTITY.cliBinary}"\nargs = ["mcp"]\n`;
+    await mkdir(dirname(codex), { recursive: true });
+    await writeFile(codex, codexConfig);
+    const state = join(home, ".rea/state.json");
+    await mkdir(dirname(state), { recursive: true });
+    await writeFile(state, "{}\n");
+    let reads = 0;
+    const fileSystem: UninstallFileSystem = {
+      ...testFileSystem,
+      readText: async (path) => {
+        if (path === config && ++reads > 1)
+          throw Object.assign(new Error("denied"), { code: "EACCES" });
+        return readFile(path, "utf8");
+      },
+    };
+    const result = await runUninstall(
+      true,
+      systemUninstallHost(home, fileSystem, {}),
+    );
+    expect(result.status).toBe("failed");
+    expect(result.items).toContainEqual(
+      expect.objectContaining({ name: "antigravity", status: "failed" }),
+    );
+    expect(await readFile(config, "utf8")).toBe(original);
+    expect(await readFile(codex, "utf8")).toBe(codexConfig);
+    expect(await readFile(state, "utf8")).toBe("{}\n");
+  });
+
   it("rechecks duplicate ownership after preflight and keeps the changed source", async () => {
     const home = await createTestTempDirectory("rea-uninstall-repeat-race-");
     const cursor = join(home, ".cursor/mcp.json");

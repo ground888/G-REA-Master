@@ -49,6 +49,11 @@ The work lands as one PR per step:
 14. [XML text checks](xml-text-checks/spec.md): XML whose DOCTYPE only names
     its DTD read as XML, starting with AbiWord, and checks of an element's
     whole text across the runs an app splits a paragraph into.
+15. [Secrets typed unseen](build-secrets/spec.md): a password or key the
+    person keeps in a file on the build host, typed by its handle, which no
+    result, log, record or exported bundle holds; sign-in and licence state
+    withheld from the seed and supplied at run time, seeded only with the
+    person's recorded consent; known handle values are checked explicitly.
 
 Version 1 covers Linux with X11, applications whose state lives in files or
 SQLite under the home directory, and real applications from public packages.

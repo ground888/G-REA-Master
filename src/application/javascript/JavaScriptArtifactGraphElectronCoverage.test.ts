@@ -344,3 +344,226 @@ it("classifies a bundle module by its loader, not by its name", async () => {
   );
   expect(externalUnderKey.electronSemantics).toBe("recovered");
 });
+
+const buildSyntheticContextBridgeGraph = async () => {
+  const mainEntry = await analyzedEntry(
+    `
+      const { BrowserWindow, ipcMain } = require("electron");
+      new BrowserWindow({ webPreferences: { preload: "./preload.cjs" } });
+      ipcMain.handle("items:upload", (event, payload) =>
+        event.sender.send("items:ack", payload),
+      );
+      ipcMain.on("items:notify", (event, message) =>
+        event.sender.send("items:seen", message),
+      );
+    `,
+    "main.cjs",
+  );
+  const preloadEntry = await analyzedEntry(
+    `
+      const { contextBridge, ipcRenderer } = require("electron");
+      const subObj = { notify: (msg) => ipcRenderer.send("items:notify", msg) };
+      const desktopApi = Object.freeze({ nested: subObj });
+      const uploadItem = async (payload) => ipcRenderer.invoke("items:upload", payload);
+      const pingItem = () => ipcRenderer.invoke("items:upload", "ping");
+      contextBridge.exposeInMainWorld("DesktopApi", desktopApi);
+      contextBridge.exposeInMainWorld("uploadItem", uploadItem);
+      contextBridge.exposeInMainWorld("PingApi", { ping: pingItem });
+      contextBridge.exposeInMainWorld("InlineApi", { ready: true });
+    `,
+    "preload.cjs",
+  );
+  const pkgFile: JavaScriptArtifactFile = {
+    ...fileFor('{"name":"synthetic-app","main":"main.cjs"}', "package.json"),
+    kind: "package-json",
+  };
+  const analysis: JavaScriptArtifactAnalysis = {
+    jsonDocuments: new JavaScriptJsonDocuments(),
+    files: [mainEntry, preloadEntry],
+    packages: [
+      {
+        path: "package.json",
+        sha256: SHA256,
+        status: "included",
+        name: "synthetic-app",
+        version: "1.0.0",
+        main: "main.cjs",
+        main_status: "declared",
+        main_entrypoint: "main.cjs",
+        renderer_declarations: {},
+        renderer_entrypoint: null,
+        limitation: null,
+      },
+    ],
+    json_modules: [],
+    html_scripts: [],
+    html_inline_scripts: [],
+    source_maps: [],
+    visited_ast_nodes: 0,
+    findings: 0,
+    modules: 0,
+    parse_failures: 0,
+    limitations: [],
+  };
+  const fileSet = {
+    files: [mainEntry.file, preloadEntry.file, pkgFile],
+    unavailable_relevant_files: [],
+    containers: [],
+    text_bytes_read: mainEntry.file.bytes + preloadEntry.file.bytes,
+    invalid_utf8_files: 0,
+  };
+  const steps = buildGraph(snapshot, fileSet, analysis);
+  let next = steps.next();
+  while (next.done !== true) next = steps.next();
+  return next.value;
+};
+
+it("projects constant-resolved and callable contextBridge exposures with IPC pairing and provenance", async () => {
+  const { graph, electronSummary } = await buildSyntheticContextBridgeGraph();
+
+  expect(electronSummary).toMatchObject({
+    electron_semantics: "recovered",
+    context_bridge_apis: 4,
+    exposed_api_members: 4,
+    ipc: expect.objectContaining({
+      paired_renderer_transmissions: 3,
+    }),
+  });
+
+  const bridgeNodes = graph.nodes.filter(
+    (node) => node.kind === "context-bridge-api",
+  );
+  const desktopNode = bridgeNodes.find(
+    (node) => node.observations[0]?.label === "DesktopApi",
+  );
+  const uploadNode = bridgeNodes.find(
+    (node) => node.observations[0]?.label === "uploadItem",
+  );
+  const pingNode = bridgeNodes.find(
+    (node) => node.observations[0]?.label === "PingApi",
+  );
+  const inlineNode = bridgeNodes.find(
+    (node) => node.observations[0]?.label === "InlineApi",
+  );
+
+  expect(desktopNode?.observations[0]).toMatchObject({
+    properties: {
+      api_status: "object-literal",
+      members: ["nested", "nested.notify"],
+      unknown_members: 0,
+      resolution_sources: [
+        expect.objectContaining({ source: "preload.cjs" }),
+        expect.objectContaining({ source: "preload.cjs" }),
+      ],
+    },
+    evidence: expect.objectContaining({
+      authority: "static-relationship-inference",
+      state: "inferred",
+      extractor: expect.objectContaining({
+        operation: "resolve-context-bridge-constant-api",
+      }),
+    }),
+  });
+  expect(uploadNode?.observations[0]).toMatchObject({
+    properties: {
+      api_status: "function",
+      members: [],
+      unknown_members: 0,
+      resolution_sources: [expect.objectContaining({ source: "preload.cjs" })],
+    },
+    evidence: expect.objectContaining({
+      authority: "static-relationship-inference",
+      state: "inferred",
+      extractor: expect.objectContaining({
+        operation: "resolve-context-bridge-constant-api",
+      }),
+    }),
+  });
+  expect(pingNode?.observations[0]).toMatchObject({
+    properties: {
+      api_status: "object-literal",
+      members: ["ping"],
+      unknown_members: 0,
+      resolution_sources: [expect.objectContaining({ source: "preload.cjs" })],
+    },
+    evidence: expect.objectContaining({
+      authority: "static-relationship-inference",
+      state: "inferred",
+      extractor: expect.objectContaining({
+        operation: "resolve-context-bridge-constant-api",
+      }),
+    }),
+  });
+  expect(inlineNode?.observations[0]).toMatchObject({
+    properties: {
+      api_status: "object-literal",
+      members: ["ready"],
+      unknown_members: 0,
+    },
+    evidence: expect.objectContaining({
+      authority: "ast-static-analysis",
+      state: "observed",
+      extractor: expect.objectContaining({
+        operation: "observe-context-bridge-api",
+      }),
+    }),
+  });
+  expect(inlineNode?.observations[0]?.properties).not.toHaveProperty(
+    "resolution_sources",
+  );
+
+  const joinedChannels = graph.edges
+    .filter(
+      (edge) =>
+        edge.evidence.extractor.operation === "join-electron-wrapper-paths",
+    )
+    .map((edge) => ({
+      relation: edge.relation,
+      channel: edge.properties.channel,
+    }));
+  expect(joinedChannels).toEqual(
+    expect.arrayContaining([
+      { relation: "invokes", channel: "items:upload" },
+      { relation: "sends", channel: "items:notify" },
+    ]),
+  );
+});
+
+it("recovers nested exposed_api_members for TypeScript-wrapped inline contextBridge objects in .cts preloads", async () => {
+  const preloadEntry = await analyzedEntry(
+    `const { contextBridge, ipcRenderer } = require("electron");\n` +
+      `const bag = { sub: { ping: () => ipcRenderer.invoke("cts:ping") } };\n` +
+      `contextBridge.exposeInMainWorld("api", ({ sub: bag.sub } as const));\n`,
+    "preload.cts",
+  );
+  const analysis: JavaScriptArtifactAnalysis = {
+    jsonDocuments: new JavaScriptJsonDocuments(),
+    files: [preloadEntry],
+    packages: [],
+    json_modules: [],
+    html_scripts: [],
+    html_inline_scripts: [],
+    source_maps: [],
+    visited_ast_nodes: 0,
+    findings: 0,
+    modules: 0,
+    parse_failures: 0,
+    limitations: [],
+  };
+  const fileSet = {
+    files: [preloadEntry.file],
+    unavailable_relevant_files: [],
+    containers: [],
+    text_bytes_read: preloadEntry.file.bytes,
+    invalid_utf8_files: 0,
+  };
+  const steps = buildGraph(snapshot, fileSet, analysis);
+  let next = steps.next();
+  while (next.done !== true) next = steps.next();
+
+  expect(next.value.electronSummary).toMatchObject({
+    electron_semantics: "recovered",
+    context_bridge_apis: 1,
+    exposed_api_members: 2,
+  });
+});

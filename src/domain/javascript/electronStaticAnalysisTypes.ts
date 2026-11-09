@@ -59,9 +59,11 @@ export type ElectronContextBridgeFinding = ElectronContextBridgeApiKey & {
   readonly resolution_basis?: "wrapper-substitution";
   readonly world: "main" | "isolated";
   readonly world_id: ElectronStaticValue | null;
-  readonly api_status: "object-literal" | "dynamic" | "missing";
+  readonly api_status: "object-literal" | "function" | "dynamic" | "missing";
   readonly members: readonly string[];
   readonly unknown_members: number;
+  /** Object or function syntax supporting constant substitution, separate from exposure. */
+  readonly resolution_sources?: readonly JavaScriptSourceRange[];
   /** Electron identity is conditional on an unproved loader. */
   readonly loader_authority?: "candidate";
   readonly module_key: string | null;

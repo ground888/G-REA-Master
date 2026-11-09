@@ -6,6 +6,10 @@ import {
 } from "./javascriptSemanticAmbientWrites.js";
 import { isIntrinsicMapLookup } from "./javascriptSemanticMapOperations.js";
 import {
+  isIntrinsicOrdinaryObjectFreezeCall,
+  unwrapUnmodifiedObjectFreezeArgument,
+} from "./javascriptSemanticObjectFreeze.js";
+import {
   isIntrinsicTypedArrayConstruction,
   isTypedArrayNumericIndex,
 } from "./javascriptSemanticTypedArrays.js";
@@ -234,7 +238,7 @@ const localAccessorMethods = (
           });
       }
     } else {
-      for (const source of branchReferenceValues(node, current.path))
+      for (const source of branchReferenceValues(node, current.path, state))
         pending.push(source);
     }
   }
@@ -355,6 +359,9 @@ export function* collectSemanticMemberMutationsSteps(
   referenceMayHaveChangedAt: JavaScriptBindingIndex["referenceMayHaveChangedAt"],
 ): Generator<void, void> {
   const deferredMapReceivers = new Set<
+    t.CallExpression | t.OptionalCallExpression
+  >();
+  const deferredObjectFreezeCalls = new Set<
     t.CallExpression | t.OptionalCallExpression
   >();
   // The binding pass already retained callable nodes. Ordinary data-only code
@@ -1680,26 +1687,33 @@ export function* collectSemanticMemberMutationsSteps(
         t.isOptionalCallExpression(node) ||
         t.isNewExpression(node)
       ) {
-        for (const source of returnedReferences(node.callee).references)
-          markEscaped(source.node, node, source.projection);
-        for (const argument of node.arguments)
-          if (t.isSpreadElement(argument))
-            deferIterable({
-              node: argument.argument,
-              projection: [],
-              path: [null],
-              fallbackPath: [],
-              bindings: new Set(),
-              effect: "escape",
-              mutation: node,
-              originAt: node,
-            });
-          else markEscaped(argument, node);
-        // Constructing a member does not pass its container as `this`.
-        if (!t.isNewExpression(node)) {
-          const mapLookup = isIntrinsicMapLookup(node, state);
-          if (mapLookup === undefined) deferredMapReceivers.add(node);
-          else if (!mapLookup) markReceiver(node.callee, node);
+        if (
+          (t.isCallExpression(node) || t.isOptionalCallExpression(node)) &&
+          isIntrinsicOrdinaryObjectFreezeCall(node, state)
+        )
+          deferredObjectFreezeCalls.add(node);
+        else {
+          for (const source of returnedReferences(node.callee).references)
+            markEscaped(source.node, node, source.projection);
+          for (const argument of node.arguments)
+            if (t.isSpreadElement(argument))
+              deferIterable({
+                node: argument.argument,
+                projection: [],
+                path: [null],
+                fallbackPath: [],
+                bindings: new Set(),
+                effect: "escape",
+                mutation: node,
+                originAt: node,
+              });
+            else markEscaped(argument, node);
+          // Constructing a member does not pass its container as `this`.
+          if (!t.isNewExpression(node)) {
+            const mapLookup = isIntrinsicMapLookup(node, state);
+            if (mapLookup === undefined) deferredMapReceivers.add(node);
+            else if (!mapLookup) markReceiver(node.callee, node);
+          }
         }
       } else if (t.isTaggedTemplateExpression(node)) {
         for (const source of returnedReferences(node.tag).references)
@@ -1715,17 +1729,22 @@ export function* collectSemanticMemberMutationsSteps(
   while (
     pendingReferences.length > 0 ||
     iterableReferences.length > 0 ||
-    deferredMapReceivers.size > 0
+    deferredMapReceivers.size > 0 ||
+    deferredObjectFreezeCalls.size > 0
   ) {
     const effectsBefore = recordedEffectCount;
     const iterablesBefore = iterableReferences.length;
     const iterationBefore: boolean = state.arrayIterationUnknown;
+    const freezesBefore = deferredObjectFreezeCalls.size;
+    const receiversBefore = deferredMapReceivers.size;
+    let inactivePendingCount = 0;
     for (const [index, reference] of pendingReferences.splice(0).entries()) {
       if (index % 64 === 0) yield;
       const { initializer } = reference;
-      if (semanticReferenceSourcesInactive(initializer, state))
+      if (semanticReferenceSourcesInactive(initializer, state)) {
         pendingReferences.push(reference);
-      else if (t.isForOfStatement(initializer.node))
+        inactivePendingCount += 1;
+      } else if (t.isForOfStatement(initializer.node))
         deferIterable({
           node: initializer.node.right,
           projection: [],
@@ -1818,6 +1837,32 @@ export function* collectSemanticMemberMutationsSteps(
         reference,
       );
     }
+    // Later ambient or getter-mediated writes can revoke an earlier
+    // Object.freeze exemption; replay full call effects when revoked.
+    let freezeIndex = 0;
+    for (const node of deferredObjectFreezeCalls) {
+      if (freezeIndex++ % 64 === 0) yield;
+      if (isIntrinsicOrdinaryObjectFreezeCall(node, state)) continue;
+      deferredObjectFreezeCalls.delete(node);
+      for (const source of returnedReferences(node.callee).references)
+        markEscaped(source.node, node, source.projection);
+      for (const argument of node.arguments)
+        if (t.isSpreadElement(argument))
+          deferIterable({
+            node: argument.argument,
+            projection: [],
+            path: [null],
+            fallbackPath: [],
+            bindings: new Set(),
+            effect: "escape",
+            mutation: node,
+            originAt: node,
+          });
+        else markEscaped(argument, node);
+      const mapLookup = isIntrinsicMapLookup(node, state);
+      if (mapLookup === undefined) deferredMapReceivers.add(node);
+      else if (!mapLookup) markReceiver(node.callee, node);
+    }
     // Native Map lookup methods do not expose their receiver to user code.
     // Settle genuine effects first, then replay every unproven receiver escape.
     // Keep proven sites until convergence: later propagated effects can revoke them.
@@ -1833,9 +1878,12 @@ export function* collectSemanticMemberMutationsSteps(
       markReceiver(node.callee, node);
     }
     if (
+      pendingReferences.length === inactivePendingCount &&
       recordedEffectCount === effectsBefore &&
       iterableReferences.length === iterablesBefore &&
-      state.arrayIterationUnknown === iterationBefore
+      state.arrayIterationUnknown === iterationBefore &&
+      deferredObjectFreezeCalls.size === freezesBefore &&
+      deferredMapReceivers.size === receiversBefore
     )
       break;
   }
@@ -1948,7 +1996,7 @@ const referencedValues = (
       state,
       widenedGetterResult,
     );
-  return branchReferenceValues(node, path);
+  return branchReferenceValues(node, path, state);
 };
 
 const constructedReferenceValues = (
@@ -1983,7 +2031,12 @@ const constructedReferenceValues = (
 const branchReferenceValues = (
   node: t.Node,
   path: PropertyPath,
+  state: JavaScriptSemanticAnalysisState,
 ): readonly ReferencedValue[] => {
+  if (t.isCallExpression(node) || t.isOptionalCallExpression(node)) {
+    const frozen = unwrapUnmodifiedObjectFreezeArgument(node, state);
+    return frozen === undefined ? [] : [{ node: frozen, path }];
+  }
   if (t.isAssignmentExpression(node))
     return node.operator === "||=" || node.operator === "??="
       ? [

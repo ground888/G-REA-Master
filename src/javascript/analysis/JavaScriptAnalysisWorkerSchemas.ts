@@ -165,9 +165,10 @@ const bridgeShape = {
   ...electronFindingContext,
   world: z.enum(["main", "isolated"]),
   world_id: staticValue.nullable(),
-  api_status: z.enum(["object-literal", "dynamic", "missing"]),
+  api_status: z.enum(["object-literal", "function", "dynamic", "missing"]),
   members: strings,
   unknown_members: count,
+  resolution_sources: z.array(range).exactOptional(),
 };
 const utilityShape = {
   ...electronFindingContext,

@@ -3,8 +3,10 @@ import * as t from "@babel/types";
 import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { ElectronStaticValue } from "./electronStaticAnalysisTypes.js";
 import {
+  isObjectPrototypeSetter,
   readExactJavaScriptLiteral,
   semanticStaticPropertyKey,
+  unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import { electronMemberPath } from "./javascriptElectronMemberWrites.js";
 import { sourceSlice } from "./javascriptStaticAnalysisHelpers.js";
@@ -93,11 +95,50 @@ export function handlerKind(
  */
 export const contextBridgeMemberPathDepth = 8;
 
-/** Collect statically visible dotted keys from one literal contextBridge API object. */
+/**
+ * Per-file work and representation budget for contextBridge member enumeration.
+ * Bounds shared sub-object DAG expansion before path strings are allocated and
+ * records truncated branches as explicit unknown members.
+ */
+export const contextBridgeMemberVisitLimit = 4_096;
+export const contextBridgeMemberByteLimit = 131_072;
+
+export interface ContextBridgeMemberBudget {
+  remainingVisits: number;
+  remainingBytes: number;
+  truncated: boolean;
+  readonly seenNodes: WeakSet<t.Node>;
+}
+
+export const createContextBridgeMemberBudget =
+  (): ContextBridgeMemberBudget => ({
+    remainingVisits: contextBridgeMemberVisitLimit,
+    remainingBytes: contextBridgeMemberByteLimit,
+    truncated: false,
+    seenNodes: new WeakSet(),
+  });
+
+export type ContextBridgeNestedPropertyResolution =
+  | {
+      readonly kind: "object";
+      readonly object: t.ObjectExpression;
+      readonly activeNodes: ReadonlySet<t.Node>;
+    }
+  | { readonly kind: "leaf" }
+  | { readonly kind: "unknown" };
+
+export type ContextBridgeNestedPropertyResolver = (
+  value: t.Node,
+  activeNodes: ReadonlySet<t.Node>,
+) => ContextBridgeNestedPropertyResolution;
+
+/** Collect statically visible dotted keys or direct callable shape from one contextBridge API argument. */
 export const collectContextBridgeMembers = (
   node: t.Node | null | undefined,
+  resolveNestedProperty?: ContextBridgeNestedPropertyResolver,
+  budget: ContextBridgeMemberBudget = createContextBridgeMemberBudget(),
 ): {
-  readonly status: "object-literal" | "dynamic" | "missing";
+  readonly status: "object-literal" | "function" | "dynamic" | "missing";
   readonly members: readonly string[];
   readonly unknown: number;
 } => {
@@ -107,7 +148,18 @@ export const collectContextBridgeMembers = (
       members: [],
       unknown: 0,
     };
-  if (!t.isObjectExpression(node))
+  const unwrapped = unwrapJavaScriptExpression(node).node;
+  if (
+    t.isArrowFunctionExpression(unwrapped) ||
+    t.isFunctionExpression(unwrapped) ||
+    t.isFunctionDeclaration(unwrapped)
+  )
+    return {
+      status: "function",
+      members: [],
+      unknown: 0,
+    };
+  if (!t.isObjectExpression(unwrapped))
     return {
       status: "dynamic",
       members: [],
@@ -117,25 +169,97 @@ export const collectContextBridgeMembers = (
     members: [],
     unknown: 0,
   };
-  collectMembersAt(node, [], state);
+  collectMembersAt(
+    unwrapped,
+    "",
+    0,
+    0,
+    state,
+    new Set([unwrapped]),
+    budget,
+    resolveNestedProperty,
+  );
   const members = [...new Set(state.members)].sort(compareUnicodeCodePoints);
   return {
-    status: "object-literal",
+    status: state.unknown === 0 ? "object-literal" : "dynamic",
     members,
     unknown: state.unknown,
   };
 };
 
+interface EffectiveObjectProperties {
+  readonly lastStaticIndexByKey: ReadonlyMap<string, number>;
+  readonly lastDynamicOrSpreadIndex: number;
+}
+
+const effectivePropertiesCache = new WeakMap<
+  t.ObjectExpression,
+  EffectiveObjectProperties
+>();
+
+const effectiveObjectProperties = (
+  object: t.ObjectExpression,
+): EffectiveObjectProperties => {
+  const cached = effectivePropertiesCache.get(object);
+  if (cached !== undefined) return cached;
+  const lastStaticIndexByKey = new Map<string, number>();
+  let lastDynamicOrSpreadIndex = -1;
+  for (let index = 0; index < object.properties.length; index += 1) {
+    const property = object.properties[index];
+    if (property === undefined) break;
+    if (t.isSpreadElement(property)) {
+      lastDynamicOrSpreadIndex = index;
+      continue;
+    }
+    const name = semanticStaticPropertyKey(property.key, property.computed);
+    if (name === null) {
+      lastDynamicOrSpreadIndex = index;
+      continue;
+    }
+    if (isObjectPrototypeSetter(property, name)) continue;
+    lastStaticIndexByKey.set(name, index);
+  }
+  const computed: EffectiveObjectProperties = {
+    lastStaticIndexByKey,
+    lastDynamicOrSpreadIndex,
+  };
+  effectivePropertiesCache.set(object, computed);
+  return computed;
+};
+
 const collectMembersAt = (
   object: t.ObjectExpression,
-  prefix: readonly string[],
+  prefixPath: string,
+  prefixDepth: number,
+  prefixBytes: number,
   state: { members: string[]; unknown: number },
+  activeNodes: ReadonlySet<t.Node>,
+  budget: ContextBridgeMemberBudget,
+  resolveNestedProperty?: ContextBridgeNestedPropertyResolver,
+  inSharedSubtree = false,
 ): void => {
-  if (prefix.length >= contextBridgeMemberPathDepth) {
+  if (prefixDepth >= contextBridgeMemberPathDepth) {
     state.unknown += 1;
     return;
   }
-  for (const property of object.properties) {
+  const shared = inSharedSubtree || budget.seenNodes.has(object);
+  budget.seenNodes.add(object);
+  const effective = effectiveObjectProperties(object);
+  for (let index = 0; index < object.properties.length; index += 1) {
+    const gated = shared || budget.truncated;
+    if (
+      gated &&
+      (budget.remainingVisits <= 0 ||
+        state.members.length >= contextBridgeMemberVisitLimit)
+    ) {
+      budget.remainingVisits = 0;
+      budget.truncated = true;
+      state.unknown += object.properties.length - index;
+      return;
+    }
+    if (gated) budget.remainingVisits -= 1;
+    const property = object.properties[index];
+    if (property === undefined) break;
     if (t.isSpreadElement(property)) {
       state.unknown += 1;
       continue;
@@ -145,18 +269,58 @@ const collectMembersAt = (
       state.unknown += 1;
       continue;
     }
-    if (
-      t.isObjectProperty(property) &&
-      !property.computed &&
-      !property.shorthand &&
-      name === "__proto__"
-    )
-      continue;
-    const segments = [...prefix, name];
-    const path = segments.join(".");
+    if (isObjectPrototypeSetter(property, name)) continue;
+    if (effective.lastStaticIndexByKey.get(name) !== index) continue;
+    const nameBytes = Buffer.byteLength(name, "utf8");
+    const pathBytes =
+      prefixDepth === 0 ? nameBytes : prefixBytes + 1 + nameBytes;
+    if (gated && pathBytes > budget.remainingBytes) {
+      budget.remainingVisits = 0;
+      budget.truncated = true;
+      state.unknown += object.properties.length - index;
+      return;
+    }
+    if (gated) budget.remainingBytes -= pathBytes;
+    const path = prefixDepth === 0 ? name : `${prefixPath}.${name}`;
     state.members.push(path);
-    if (t.isObjectProperty(property) && t.isObjectExpression(property.value))
-      collectMembersAt(property.value, segments, state);
+    if (effective.lastDynamicOrSpreadIndex > index) continue;
+    if (!t.isObjectProperty(property)) {
+      if (property.kind !== "method") state.unknown += 1;
+      continue;
+    }
+    if (resolveNestedProperty !== undefined) {
+      const nested = resolveNestedProperty(property.value, activeNodes);
+      if (nested.kind === "object")
+        collectMembersAt(
+          nested.object,
+          path,
+          prefixDepth + 1,
+          pathBytes,
+          state,
+          nested.activeNodes,
+          budget,
+          resolveNestedProperty,
+          shared,
+        );
+      else if (nested.kind === "unknown") state.unknown += 1;
+      continue;
+    }
+    const nestedValue = unwrapJavaScriptExpression(property.value).node;
+    if (t.isObjectExpression(nestedValue) && !activeNodes.has(nestedValue)) {
+      const nextActive = new Set(activeNodes);
+      nextActive.add(nestedValue);
+      collectMembersAt(
+        nestedValue,
+        path,
+        prefixDepth + 1,
+        pathBytes,
+        state,
+        nextActive,
+        budget,
+        undefined,
+        shared,
+      );
+    }
   }
 };
 

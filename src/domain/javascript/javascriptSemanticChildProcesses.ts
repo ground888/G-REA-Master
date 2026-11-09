@@ -76,6 +76,8 @@ export const collectJavaScriptSemanticChildProcesses = (
   const candidates = collectSpawns(program, state, callables).filter(
     (candidate) =>
       !forkRejectsStdioArray(candidate, context) &&
+      !rejectsStdioLiteral(candidate, context) &&
+      !rejectsStringOptionLiteral(candidate, context) &&
       !rejectsOptionsShape(candidate, context, state),
   );
   const childProcessSpawns = candidates.map((candidate) =>
@@ -449,6 +451,38 @@ const environmentSupplied = (
   return staticJavaScriptTruthiness(value) !== false;
 };
 
+/**
+ * The `stdio` string values Node accepts for `spawn`, `execFile` and `fork`.
+ *
+ * Measured on Node 24.22.1: `"pipe"`, `"overlapped"`, `"inherit"` and `"ignore"` start a
+ * child; `"ipc"`, `"PIPE"`, `"pipe "`, `"pipeline"`, `"stream"` and `"stdio"` all throw
+ * `ERR_INVALID_ARG_VALUE` before anything is created. The set is exact and case-sensitive.
+ */
+const STREAM_STDIO_MODES = new Set([
+  "pipe",
+  "overlapped",
+  "inherit",
+  "ignore",
+] as const);
+
+/**
+ * Whether a literal `stdio` string makes the call throw before a child exists.
+ *
+ * `spawn` and `execFile` pass the string through `getValidStdio` unchanged, so every value
+ * outside `STREAM_STDIO_MODES` throws. `fork` appends `"ipc"` to a string and then splits
+ * it, so an empty string becomes the single element `"ipc"`, which `fork` refuses because
+ * the IPC channel must be paired with at least one standard stream. Measured on Node
+ * 24.22.1: `spawn(..., {stdio: ""})` starts a child while `fork(..., {stdio: ""})` throws
+ * `ERR_INVALID_ARG_VALUE`.
+ */
+const rejectsStdioString = (
+  value: string,
+  method: JavaScriptSemanticChildProcessSpawn["method"],
+): boolean =>
+  (STREAM_STDIO_MODES as ReadonlySet<string>).has(value)
+    ? false
+    : method === "fork" || value !== "";
+
 const stdioMode = (
   options: t.Node | undefined,
   method: JavaScriptSemanticChildProcessSpawn["method"],
@@ -472,6 +506,29 @@ const stdioMode = (
   if (method === "fork" && staticJavaScriptTruthiness(value) !== undefined)
     return unsetStdioMode(expression, method, context);
   return "dynamic";
+};
+
+/**
+ * Whether a literal `stdio` member is a value Node refuses at the call site.
+ *
+ * Only a string outside `STREAM_STDIO_MODES` (and `""` on `fork`) is decided here. A
+ * number, boolean or object is also refused, but `stdioMode` already reports those as
+ * `"dynamic"`, and rejecting them would claim more than the reported mode explains.
+ */
+const rejectsStdioLiteral = (
+  candidate: SpawnCandidate,
+  context: ChildSpawnContext,
+): boolean => {
+  if (candidate.method === "exec") return false;
+  const { options } = spawnArguments(candidate, context);
+  if (options === undefined) return false;
+  const expression = unwrapJavaScriptExpression(options).node;
+  if (context.isNullish(expression)) return false;
+  const lookup = staticObjectProperty(expression, "stdio", context.isNullish);
+  if (lookup.status !== "explicit") return false;
+  const value = unwrapJavaScriptExpression(lookup.value).node;
+  if (!t.isStringLiteral(value)) return false;
+  return rejectsStdioString(value.value, candidate.method);
 };
 
 /**
@@ -510,6 +567,48 @@ const forkRejectsStdioArray = (
   return ipcCount !== 1;
 };
 
+/**
+ * Option members Node requires to be a string when they are supplied at all.
+ *
+ * Measured on Node 24.22.1, `{cwd: 5}`, `{cwd: true}`, `{cwd: {}}`, `{cwd: []}` and
+ * `{cwd: 0}` all throw `ERR_INVALID_ARG_TYPE` on `spawn`, `fork`, `execFile` and `exec`
+ * alike, while `{cwd: "/tmp"}` and `{cwd: null}` start a child. `argv0` behaves the same
+ * way. Both are validated before the child is created, so such a call is not a spawn.
+ * `env` is deliberately absent: Node accepts any `env` value, including `5` and `"x"`.
+ */
+const STRING_OPTION_MEMBERS = ["cwd", "argv0"] as const;
+
+/**
+ * Whether a `cwd` or `argv0` literal is a non-string, non-nullish value Node refuses.
+ *
+ * Only an exactly readable literal is decided. A binding, a call or a member read stays
+ * undecided, because its value is not settled by this expression.
+ */
+const rejectsStringOptionLiteral = (
+  candidate: SpawnCandidate,
+  context: ChildSpawnContext,
+): boolean => {
+  const { options } = spawnArguments(candidate, context);
+  if (options === undefined) return false;
+  const expression = unwrapJavaScriptExpression(options).node;
+  if (context.isNullish(expression)) return false;
+  for (const member of STRING_OPTION_MEMBERS) {
+    const lookup = staticObjectProperty(expression, member, context.isNullish);
+    if (lookup.status !== "explicit") continue;
+    const value = unwrapJavaScriptExpression(lookup.value).node;
+    if (context.isNullish(value)) continue;
+    if (t.isStringLiteral(value)) continue;
+    // `exec` spreads its options into `spawn`'s, so it validates the same members.
+    if (readExactJavaScriptLiteral(value).found) return true;
+    if (
+      t.isObjectExpression(value) ||
+      t.isArrayExpression(value) ||
+      t.isBooleanLiteral(value)
+    )
+      return true;
+  }
+  return false;
+};
 /**
  * Node validates the options object before creating anything, so a literal
  * primitive or literal array in that slot throws ERR_INVALID_ARG_TYPE

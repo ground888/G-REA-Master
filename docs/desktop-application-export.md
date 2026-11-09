@@ -154,9 +154,11 @@ The class declares:
   Files the capture recorded under a symlinked state directory's physical
   spelling are mapped back to the innermost such directory's home spelling,
   unless that spelling is outside the captured home, as when the home itself is
-  a symbolic link. When two files map to one home path, the export uses the one
-  present before the capture, else the first by path, and a limitation names
-  the other.
+  a symbolic link. When a selected link names an application state directory,
+  the bundle seeds the application's state path and restores the selected
+  alias at boot. Selections nested under that alias are seeded under the same
+  state path. An existing incompatible alias stops setup without replacing it. When two files map to one home path, the export uses the one present
+  before the capture, else the first by path, and a limitation names the other.
 - Data hooks, because declaring any hook switches off agentenv's default data
   plane: the class seeds the home once per boot and keeps it as the initial
   state with `keep_initial`, `data/add` and `data/reset` call agentenv's `add`
@@ -169,10 +171,43 @@ retain is not seeded: one in the state view without retained content at that
 checkpoint, or one the capture omitted (for example too large or past the
 content budget). The result lists them in `unseeded_files` and the README
 names them. When the application held files open in folders whose starting
-content the capture did not retain, a limitation names those folders. The
-desktop Trash, `~/.local/share/Trash`, is never the application's, so a file
-the user moved there is neither owned nor seeded, even when a window title
-names it; a limitation lists the files the Trash held at the seed.
+content the capture did not retain, a limitation names those folders, spelled
+from `~/` under the home: a file there is seeded only when the capture
+retained it, as it does one written during the capture, and the limitation
+names the seed files there or says there are none. The desktop Trash,
+`~/.local/share/Trash`, is never the application's, so a file the user moved
+there is neither owned nor seeded, even when a window title names it; a
+limitation lists the files the Trash held at the seed.
+
+Files that changed during the capture outside the owned paths are neither
+owned nor seeded, so the app starts without what it saved there: MuseScore
+keeps its settings in `~/.config/MuseScore`, which its name rules miss, and
+showed its first-run wizard on every boot. A limitation and the README name
+those folders, leaving out desktop services' files, each collapsed to its
+folder in `~/.config`, `~/.local/share`, `~/.local/state` or `~/.local`, the
+hidden folder of the home it lies in, or else its own folder, up to eight and
+a count of the rest. Capture again naming them with `--state-path`, or
+`state_paths` on a build computer, to own them.
+
+Lock files the app holds while it runs are left out of the seed: a copied one
+makes the app find its profile or document in use, and a LibreOffice Calc
+bundle whose seed held its profile's `.lock` showed no window at boot. They
+are `lockfile`, `lock`, `.lock`, `.parentlock`, `parent.lock` and
+`SingletonLock` anywhere, LibreOffice's document lock `.~lock.<name>#`, and
+`*.lock` or `*.lck` directly in one of the application's state directories.
+Elsewhere such a file may be a project's own, such as `Cargo.lock` or
+`yarn.lock`, which pin dependencies, and is seeded, even under a folder whose
+name starts with a dot. A file the state view makes a document, or one named
+itself by `--state-path` or an absolute `--argument`, is never left out,
+whatever its name. A limitation and the README list them, up to
+eight and a count, after "Left out of the seed". They stay under the owned
+paths, so `data/get` returns the lock the running app holds, and `data/reset`
+restores the seed without them. Other seed files the app keeps for its own
+running are seeded as captured and named, collapsed to the folder that holds
+them: WebKit or Chromium storage (such as `hsts-storage.sqlite`, `storage/`,
+`mediakeys/`, `Local Storage/`, `IndexedDB/`, `Cookies`), which may hold the
+app's own data, and caches (a folder whose name ends in `cache`); a stale one
+can change how the app starts.
 
 The application's dconf keys at the seed, if any, are written once when the
 app first starts, also for an application that owns no files, and the class adds
@@ -182,7 +217,11 @@ existing user database through a `file-db:` profile, then runs `dconf compile`
 on that dump and the captured keys, in that name order so the captured keys
 win, and replaces `~/.config/dconf/user`. If that fails, the server prints a
 one-line warning and the app starts without the captured keys. `data/reset` does
-not restore them.
+not restore them. No file of the bundle holds them, so `data/get` does not
+return them and no task check reads them; a draft whose only change between
+its checkpoints is to the application's dconf keys says so with
+`uncheckable_changes`, and one whose dconf database changed but could not be
+read says so with `unreadable_changes`.
 
 ## The seed checkpoint
 
@@ -317,6 +356,39 @@ the capture's `package_file_reason` when there is one; when the archive or a
 declared vendor repository installs the package already; when the URL is not
 written as `http://` or `https://` or holds a user name or password; and when
 the file is built for an architecture other than `amd64`, `arm64` or `all`.
+
+## Grading once the app has saved
+
+A task's verifier, `artifacts/<task>-check/verify.py`, grades the app's files
+only once they have settled, because an app can save on its own timer after the
+last change. Gnote saves a note 4 s after the last key, so a read taken as
+soon as the agent stops finds the text on screen but not yet in the file. The
+verifier reads the app's `data/get` every 0.5 s. It compares each file's bytes
+between reads by their SHA-256, as `data/get` returns them, and grades once
+every file has held for 3 s. The 3 s count from when a read returned the
+current bytes, not when it began, so a slow read that brings a change late
+does not count its own run as quiet. 15 s after the first read began, the
+bound, the verifier grades the last completed read: no read starts at or
+after the bound, and a read still running then is cut. Each result records
+whether the files settled in `settled`, and whether the bound cut a read in
+`read_cut`.
+
+The window has a cost and a limit:
+
+- An app whose files do not change during the check, such as one that saved
+  at once, is graded 3 s after the first read returns.
+- A save that lands more than 3 s after the first read returns is still
+  missed. An app that saves 4 s after the last key is caught only when the
+  agent stops at least a second after that key.
+- Files the app rewrites more often than every 3 s, such as a log, never
+  settle, so every check waits until the bound.
+- The bound counts the reads too, so a slow `data/get` ends the check at
+  15 s. Only the first read, which every grade needs, runs to its own
+  timeout.
+
+The bound and window are `SETTLE_BOUND_S` and `SETTLE_WINDOW_S` in the
+verifier. `check_build_task` waits the same way before it grades each
+witness stage; see [witnessing](desktop-build-witness.md#witness).
 
 ## Typed views
 

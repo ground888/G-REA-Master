@@ -207,6 +207,41 @@ export type ElectronUtilityProcessFinding = ElectronUtilityProcessFindingState &
       }
   );
 
+/** Scope where an `app.asar` -> `app.asar.unpacked` string replacement applies. */
+export interface ElectronAsarUnpackedRewriteScope {
+  readonly directory: string;
+  readonly replace_all?: boolean;
+}
+
+/** Proven loader or bounded path-candidate metadata for a native .node binding. */
+export type ElectronNativeAddonResolution =
+  | {
+      readonly kind: "node-gyp-build";
+      readonly directory: string;
+      readonly asar_unpacked?: boolean;
+      readonly asar_unpacked_replace_all?: boolean;
+      readonly asar_unpacked_scope?: ElectronAsarUnpackedRewriteScope;
+    }
+  | {
+      readonly kind: "bindings";
+      readonly addon_name: string;
+      readonly module_root: string | null;
+      readonly asar_unpacked?: boolean;
+      readonly asar_unpacked_replace_all?: boolean;
+      readonly asar_unpacked_scope?: ElectronAsarUnpackedRewriteScope;
+    }
+  | {
+      readonly kind: "candidates";
+      readonly loader?: "dlopen";
+      readonly lookup?: "commonjs" | "exact-file";
+      readonly resolution_context: JavaScriptStaticPathContext;
+      readonly candidates: readonly string[];
+      readonly resolution_base_path?: string;
+      readonly asar_unpacked?: boolean;
+      readonly asar_unpacked_replace_all?: boolean;
+      readonly asar_unpacked_scope?: ElectronAsarUnpackedRewriteScope;
+    };
+
 /** JavaScript-side binding or re-export requested from one native .node addon. */
 export interface ElectronNativeAddonBindingFinding {
   readonly specifier: string;
@@ -217,6 +252,8 @@ export interface ElectronNativeAddonBindingFinding {
   /** Omitted in legacy findings; omission means unknown, not false. */
   readonly namespace_access?: boolean;
   readonly dynamic_member_access?: boolean;
+  /** Present when resolution uses a helper package or bounded path candidates. */
+  readonly resolution?: ElectronNativeAddonResolution;
   /** Electron identity is conditional on an unproved loader. */
   readonly loader_authority?: "candidate";
   readonly module_key: string | null;

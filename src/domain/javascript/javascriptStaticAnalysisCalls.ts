@@ -1,8 +1,10 @@
+import { posix } from "node:path";
 import {
   isBrowserNetworkRequest,
   isFetchCall,
 } from "./javascriptNetworkRequests.js";
 import * as t from "@babel/types";
+import { resolveRequireResolveSearchOptions } from "./electronNativeAddonLoaders.js";
 import { isIntrinsicMapLookup } from "./javascriptSemanticMapOperations.js";
 import { traverseJavaScriptValueAst } from "./javascriptSemanticTraversal.js";
 import { semanticIdentifierRole } from "./javascriptSemanticProjection.js";
@@ -322,10 +324,27 @@ const requireCallSpecifier = (
     index,
   );
   if (call === undefined || call.loader === "local") return null;
-  if (call.loader === "unknown" || !call.sourceRelative) {
+  const searchOptions =
+    call.operation === "resolve"
+      ? resolveRequireResolveSearchOptions(
+          call.arguments,
+          context,
+          bindings,
+          node,
+          call.loader,
+          call.sourceRelativePath,
+        )
+      : ({ kind: "default" } as const);
+  if (
+    call.loader === "unknown" ||
+    !call.sourceRelative ||
+    searchOptions.kind === "unresolved"
+  ) {
     context.accumulator.unknownFindings += 1;
     const candidate =
-      !call.memberUnproven && call.loaderAuthority === "candidate"
+      !call.memberUnproven &&
+      call.loaderAuthority === "candidate" &&
+      searchOptions.kind === "default"
         ? (argumentValue(call.arguments?.[0]) ?? undefined)
         : undefined;
     return {
@@ -336,9 +355,33 @@ const requireCallSpecifier = (
         : { loaderAuthority: "candidate" as const }),
     };
   }
+  const specifier = argumentValue(call.arguments?.[0]);
+  if (searchOptions.kind === "directory") {
+    if (
+      searchOptions.asarUnpacked ||
+      specifier === undefined ||
+      (!specifier.startsWith("./") && !specifier.startsWith("../"))
+    ) {
+      context.accumulator.unknownFindings += 1;
+      return { specifier: undefined, operation: call.operation };
+    }
+    return {
+      operation: call.operation,
+      specifier,
+      resolutionBasePath: posix.join(
+        searchOptions.directory,
+        "__resolve_base__",
+      ),
+      ...(call.loader === "commonjs-loader" ||
+      call.loader === "factory-loader" ||
+      call.loader === "create-require"
+        ? { loader: call.loader }
+        : {}),
+    };
+  }
   return {
     operation: call.operation,
-    specifier: argumentValue(call.arguments?.[0]),
+    specifier,
     ...(call.sourceRelativePath === undefined
       ? {}
       : { resolutionBasePath: call.sourceRelativePath }),

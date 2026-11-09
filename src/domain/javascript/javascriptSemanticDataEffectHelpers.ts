@@ -23,6 +23,7 @@ import {
 } from "./javascriptSemanticPropertyPaths.js";
 
 import { semanticCallableIdForNode } from "./javascriptSemanticProjection.js";
+import { isUnmodifiedGlobalReference } from "./javascriptSemanticGlobalReference.js";
 import {
   semanticBindingAtRead,
   semanticTopLevelEffectFollowsCapture,
@@ -734,6 +735,7 @@ const BUILTIN_RECEIVER_METHODS: Readonly<Record<string, ReadonlySet<string>>> =
   {
     path: new Set(["resolve", "join", "dirname"]),
     "path/posix": new Set(["resolve", "join", "dirname"]),
+    os: new Set(["platform", "arch"]),
     url: new Set(["fileURLToPath"]),
     fs: new Set([
       "readFile",
@@ -755,7 +757,7 @@ const BUILTIN_RECEIVER_METHODS: Readonly<Record<string, ReadonlySet<string>>> =
     http: new Set(["request", "get"]),
     https: new Set(["request", "get"]),
     child_process: new Set(["spawn", "exec", "execFile", "fork"]),
-    process: new Set(["cwd", "uptime", "hrtime", "nextTick"]),
+    process: new Set(["cwd", "uptime", "hrtime", "nextTick", "dlopen"]),
     timers: new Set([
       "setTimeout",
       "setInterval",
@@ -1126,6 +1128,70 @@ export const isSemanticProcessObject = (
       selected,
     )?.length === 0
   );
+};
+
+/** Check global `process.<member>` / `globalThis.process.<member>` against both ambient and `node:process` module effects. */
+export const isUnmodifiedGlobalProcessMember = (
+  node: t.Node,
+  state: JavaScriptSemanticAnalysisState,
+  member: string,
+  capture: t.Node = node,
+): boolean =>
+  isUnmodifiedGlobalReference(node, state, ["process", member]) &&
+  !requiredModuleChanged("process", [member], capture, state, true);
+
+/** Resolve an unmodified host axis (`platform` or `arch`) from `process` or `node:process`. */
+export const semanticProcessHostAxis = (
+  node: t.Node,
+  state: JavaScriptSemanticAnalysisState,
+  selectedPath: readonly string[] = [],
+  capture: t.Node = node,
+): "platform" | "arch" | undefined => {
+  const required = semanticRequireOrigin(node, state);
+  if (required !== undefined) {
+    const origin = builtinNamespaceOrigin(required.origin);
+    const fullPath = [...origin.importedPath, ...selectedPath];
+    return origin.specifier === "process" &&
+      fullPath.length === 1 &&
+      (fullPath[0] === "platform" || fullPath[0] === "arch") &&
+      !state.ambientWrites.covers(["global", "process", fullPath[0]]) &&
+      !requiredModuleChanged(
+        required.origin.specifier,
+        fullPath,
+        capture,
+        state,
+        true,
+      )
+      ? fullPath[0]
+      : undefined;
+  }
+  if (!t.isIdentifier(node)) return undefined;
+  const binding = resolveSemanticBindingState(state, node, node.name);
+  if (binding === undefined) {
+    return selectedPath.length === 1 &&
+      (selectedPath[0] === "platform" || selectedPath[0] === "arch") &&
+      !state.ambientWrites.covers(["global", "process", selectedPath[0]]) &&
+      semanticGlobalProcessOrigin(node, state) !== undefined &&
+      !requiredModuleChanged("process", selectedPath, capture, state, true)
+      ? selectedPath[0]
+      : undefined;
+  }
+  const resolved = builtinBindingPath(
+    binding,
+    state,
+    ["process", "node:process"],
+    capture,
+    false,
+    selectedPath,
+    true,
+  );
+  const fullPath =
+    resolved === null ? undefined : [...resolved, ...selectedPath];
+  return fullPath?.length === 1 &&
+    (fullPath[0] === "platform" || fullPath[0] === "arch") &&
+    !state.ambientWrites.covers(["global", "process", fullPath[0]])
+    ? fullPath[0]
+    : undefined;
 };
 
 /** Preserve conditional process identity across loader and mutation uncertainty. */

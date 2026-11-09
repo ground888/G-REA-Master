@@ -7,7 +7,11 @@ import { createTestTempDirectory } from "./temporaryDirectory.js";
 /**
  * A stand-in for REA inside a build computer: `capture-desktop-application`
  * reads its requests from stdin and acknowledges each as REA's capture does,
- * then publishes a prepared capture folder on stop; `describe-...` and
+ * then publishes a prepared capture folder on stop. It prints the failure in
+ * the file `FAKE_REA_CAPTURE_FAILURE` names instead of launching, and the one
+ * in `FAKE_REA_MARK_FAILURE` at its first checkpoint, exiting 1 either way;
+ * `FAKE_REA_APP_EXITS` names the folder it publishes at once, as when the
+ * app exits before its window opens. `describe-...` and
  * `export-...` print outputs the real CLI wrote for that folder, and the
  * export copies the bundle it wrote. Each call notes its arguments, its
  * working folder and which AGENTENV_ variables and APT_CONFIG it saw.
@@ -42,9 +46,25 @@ command, args = sys.argv[1], sys.argv[2:]
 note("calls.jsonl", {"argv": sys.argv[1:], "cwd": os.getcwd(), "apt_config": os.environ.get("APT_CONFIG"),
                      "agentenv": sorted(name for name in os.environ if name.startswith("AGENTENV_"))})
 if command == "capture-desktop-application":
+    failure = os.environ.get("FAKE_REA_CAPTURE_FAILURE")
+    if failure is not None:
+        with open(failure) as handle:
+            sys.stdout.write(handle.read())
+        sys.exit(1)
     progress("Recorded checkpoint baseline.", {"kind": "checkpoint", "name": "baseline", "trigger": "baseline",
                                                 "at_ms": 0, "entries": 4, "changes": 0, "retained_files": 1,
                                                 "retained_bytes": 17})
+    exited = os.environ.get("FAKE_REA_APP_EXITS")
+    if exited is not None:
+        # The app exits before its window opens, so the capture ends on its own and publishes what it saw.
+        progress("Launching notes.")
+        progress("Recorded checkpoint exit.", {"kind": "checkpoint", "name": "exit", "trigger": "exit", "at_ms": 1080,
+                                               "entries": 4, "changes": 0, "retained_files": 0, "retained_bytes": 0})
+        out = option(args, "--output")
+        shutil.copytree(exited, out)
+        with open(os.path.join(out, "capture.json")) as handle:
+            sys.stdout.write(handle.read())
+        sys.exit(0)
     progress("The application window is open.", {"kind": "window_open"})
     taken = set()
     for line in sys.stdin:
@@ -52,6 +72,11 @@ if command == "capture-desktop-application":
         if text == "stop":
             break
         name = text[len("checkpoint "):].strip()
+        failure = os.environ.get("FAKE_REA_MARK_FAILURE")
+        if failure is not None:
+            with open(failure) as handle:
+                sys.stdout.write(handle.read())
+            sys.exit(1)
         if name in taken:
             progress("refused", {"kind": "checkpoint_refused", "name": name,
                                  "reason": f"A checkpoint named {name} was already recorded."})
@@ -70,6 +95,12 @@ elif command == "describe-desktop-application-task":
         sys.stdout.write(handle.read())
 elif command == "export-desktop-application":
     if "--schema" in args:
+        if os.environ.get("FAKE_REA_SCHEMA_TOKEN"):
+            if os.environ["FAKE_REA_SCHEMA_TOKEN"] == "invalid":
+                print("fake-control-token-0123456789abcdef")
+                sys.exit(0)
+            print("runtime output fake-control-token-0123456789abcdef", file=sys.stderr)
+            sys.exit(23)
         if os.environ.get("FAKE_REA_SCHEMA_FAILURE"):
             print("runtime cannot load its export command", file=sys.stderr)
             sys.exit(23)

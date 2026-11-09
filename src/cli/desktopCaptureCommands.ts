@@ -168,6 +168,18 @@ const registerDesktopExportCommand = (
         .describe(
           "http or https URL the computer downloads the captured --package-file from when the bundle is put, for an application installed from a .deb file",
         ),
+      downloadInstall: z
+        .string()
+        .optional()
+        .describe(
+          "JSON file naming the AppImage or tarball a build computer unpacked the application from: kind, desktop_entry, url, sha256, architecture, and a tarball's program and name",
+        ),
+      extraPackage: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Ubuntu 24.04 archive package installed beside the application, such as a runtime piece its package does not install; repeat for more",
+        ),
       syntheticSeed: z
         .boolean()
         .default(false)
@@ -198,6 +210,11 @@ const registerDesktopExportCommand = (
                       absoluteCallerPath(path),
                     ),
                     packageUrl: options.packageUrl,
+                    downloadInstall:
+                      options.downloadInstall === undefined
+                        ? undefined
+                        : absoluteCallerPath(options.downloadInstall),
+                    extraPackages: options.extraPackage,
                     seedCheckpoint: options.seedCheckpoint,
                     endCheckpoint: options.endCheckpoint,
                     syntheticSeed: options.syntheticSeed,

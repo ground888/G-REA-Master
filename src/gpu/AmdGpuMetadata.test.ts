@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
 import { encode } from "@msgpack/msgpack";
+import { BinaryResourceFailure } from "../native/metadata/BinaryContainer.js";
 import { readAmdMetadata } from "./AmdGpuMetadata.js";
 it.each(["\uFEFFkernel", "\uFEFF" + "kernel".repeat(100)])(
   "preserves leading BOMs in MessagePack strings %s",
@@ -41,4 +42,32 @@ it("distinguishes an unsupported extension tag from a forbidden MessagePack toke
   expect(() => readAmdMetadata(Buffer.from("c1", "hex"))).toThrow(
     expect.objectContaining({ kind: "malformed" }),
   );
+});
+it("refuses a valid array or map past the decoder limit as a capacity failure", () => {
+  const array = (length: number) => {
+    const header = Buffer.alloc(5);
+    header[0] = 0xdd;
+    header.writeUInt32BE(length, 1);
+    return Buffer.concat([header, Buffer.alloc(length, 0xc0)]);
+  };
+  expect(readAmdMetadata(array(65536))).toHaveLength(65536);
+  expect(() => readAmdMetadata(array(65537))).toThrow(BinaryResourceFailure);
+  const map = (pairs: number) => {
+    const header = Buffer.alloc(5);
+    header[0] = 0xdf;
+    header.writeUInt32BE(pairs, 1);
+    const entries = Array.from({ length: pairs }, (_, index) => {
+      const key = `k${String(index)}`;
+      return Buffer.concat([
+        Buffer.from([0xa0 | key.length]),
+        Buffer.from(key),
+        Buffer.from([0xc0]),
+      ]);
+    });
+    return Buffer.concat([header, ...entries]);
+  };
+  expect(Object.keys(readAmdMetadata(map(65536)) as object)).toHaveLength(
+    65536,
+  );
+  expect(() => readAmdMetadata(map(65537))).toThrow(BinaryResourceFailure);
 });

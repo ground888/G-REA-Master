@@ -9,6 +9,7 @@ import type {
   DesktopBuildComputers,
   ForwardedResult,
 } from "../application/desktop/DesktopBuildComputers.js";
+import type { ProgressReporter } from "../application/ProgressReporter.js";
 import { DesktopBuildSteps } from "../application/desktop/DesktopBuildSteps.js";
 import { toolContract } from "../contracts/toolContracts.js";
 import type { ToolContract } from "../contracts/toolContractTypes.js";
@@ -38,11 +39,15 @@ const admit = <Schema extends z.ZodType>(
 
 const HEARTBEAT_MS = 5_000;
 
-/** Report progress every few seconds while a long build step works, so a client's request timeout can reset. */
+/**
+ * Report progress every few seconds while a long build step works, so a
+ * client's request timeout can reset; the step reports on the same
+ * reporter, whose notifications keep one order.
+ */
 const withHeartbeat = async <Value>(
   context: ServerContext,
   phase: string,
-  run: () => Promise<Value>,
+  run: (progress: ProgressReporter) => Promise<Value>,
 ): Promise<Value> => {
   const progress = mcpProgressReporter(context);
   const startedAt = Date.now();
@@ -57,7 +62,7 @@ const withHeartbeat = async <Value>(
       .catch(() => undefined);
   }, HEARTBEAT_MS);
   try {
-    return await run();
+    return await run(progress);
   } finally {
     clearInterval(timer);
   }
@@ -128,7 +133,10 @@ const registerPlain = <Schema extends z.ZodType>(
 /** Register the build computer session tools and the build steps on them on the REA MCP server. */
 export const registerDesktopBuildTools = (
   server: EvidenceMcpServer,
-  computers: Pick<DesktopBuildComputers, "start" | "act" | "close" | "steps">,
+  computers: Pick<
+    DesktopBuildComputers,
+    "start" | "act" | "close" | "steps" | "measure"
+  >,
   logger: Logger,
 ): void => {
   const tool = <Name extends Parameters<typeof toolContract>[0]>(
@@ -169,8 +177,14 @@ export const registerDesktopBuildTools = (
     ),
   );
   registerPlain(tool("check_build_task"), (input, context) =>
-    withHeartbeat(context, "check_build_task", () =>
-      steps.checkTask(input, context.mcpReq.signal),
+    withHeartbeat(context, "check_build_task", (progress) =>
+      steps.checkTask(input, context.mcpReq.signal, progress),
+    ),
+  );
+  // Solves run one at a time for minutes each, so progress keeps the client waiting.
+  registerPlain(tool("measure_build_task"), (input, context) =>
+    withHeartbeat(context, "measure_build_task", (progress) =>
+      computers.measure(input, context.mcpReq.signal, progress),
     ),
   );
   registerPlain(tool("close_build_computer"), (input) =>

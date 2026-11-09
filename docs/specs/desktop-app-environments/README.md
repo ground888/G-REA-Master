@@ -49,6 +49,18 @@ The work lands as one PR per step:
 14. [XML text checks](xml-text-checks/spec.md): XML whose DOCTYPE only names
     its DTD read as XML, starting with AbiWord, and checks of an element's
     whole text across the runs an app splits a paragraph into.
+15. [Several tasks](several-tasks/spec.md): one capture yields several
+    tasks, each checked at its own end checkpoint and, when one was taken,
+    failing at its near miss; the eval lists them all and each is witnessed
+    on its own fresh computer.
+16. [Task difficulty](task-difficulty/spec.md): a build tool solves a
+    bundle's task in fresh computers for a model, 3 times and 2 more unless
+    they passed none or all, within a budget, and records its band, cost,
+    turns and failures per check in the bundle.
+17. [Download installs](download-installs/spec.md): applications no package
+    offers, from their project's AppImage or tarball pinned by URL and
+    SHA-256, unpacked under `/opt/rea-apps` by the build computer and the
+    export alike, starting with FreeCAD.
 
 Version 1 covers Linux with X11, applications whose state lives in files or
 SQLite under the home directory, and real applications from public packages.

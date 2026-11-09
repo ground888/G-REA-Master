@@ -1,4 +1,5 @@
 import { AnalysisError } from "../../domain/analysisErrorBase.js";
+import type { DownloadInstall } from "../../domain/desktop/appDownloadInstall.js";
 import {
   DESKTOP_EXPORT_FRAMEWORK_VERSION,
   appModuleFile,
@@ -7,7 +8,6 @@ import {
   launchDocumentLimitation,
   renderAppClass,
   renderEnvToml,
-  renderInstallScript,
   renderReadme,
   renderSkill,
   renderSmokeTask,
@@ -15,7 +15,16 @@ import {
   type HomePathCollision,
   type SeedScrubReport,
 } from "../../domain/desktop/appExport.js";
-import { INSTALL_SCRIPT } from "../../domain/desktop/appExportInstall.js";
+import {
+  heldOpenLimitation,
+  leftOutLocksLimitation,
+  trashedFiles,
+  runtimeSeeds,
+  runtimeSeedsLimitation,
+  unownedChangedFolders,
+  unownedFoldersLimitation,
+  unreadDconfLimitation,
+} from "../../domain/desktop/appExportUnowned.js";
 import { installLimitations } from "../../domain/desktop/appExportInstallLimitations.js";
 import type { DesktopApplicationCapture } from "../../domain/desktop/desktopCapture.js";
 import {
@@ -25,6 +34,7 @@ import {
 } from "../../domain/desktop/desktopState.js";
 import { isWithinAny } from "../../domain/desktop/desktopStateDiff.js";
 import type { HostIdentity } from "../../domain/desktop/hostIdentity.js";
+import { recoveryListLimitation } from "../../domain/desktop/seedRecoveryList.js";
 import { scrubDconf } from "../../domain/desktop/seedScrub.js";
 import { createEvidence, type Evidence } from "../../domain/evidence.js";
 import type { JsonValue } from "../../domain/jsonValue.js";
@@ -40,6 +50,8 @@ import {
 import {
   admitApplication,
   exportEnvironmentName,
+  installFiles,
+  readDownloadInstall,
 } from "./DesktopExportInstall.js";
 import {
   writeOutputTree,
@@ -52,9 +64,13 @@ import {
   type SeedVersion,
 } from "./DesktopExportFiles.js";
 import { withRetainedContent } from "./DesktopRetainedContent.js";
-import { planLaunch, seedVersions } from "./DesktopExportLaunch.js";
+import { planLaunch, seedModes, seedVersions } from "./DesktopExportLaunch.js";
 import { selectStateEnds } from "./DesktopStateVersions.js";
-import { admitDesktopTask, type AdmittedTask } from "./DesktopTaskExport.js";
+import {
+  admitDesktopTasks,
+  type AdmittedTasks,
+  type TaskSummary,
+} from "./DesktopTaskExport.js";
 
 const OPERATION = "export_desktop_application";
 /** Largest seed file the export copies; the state view reads only 64 MiB. */
@@ -65,13 +81,19 @@ export interface DesktopExportRequest {
   readonly capture: string;
   readonly directory: string;
   readonly name: string | undefined;
-  /** Task files to validate and add; a capture yields at most one. */
+  /** Task files to validate and add, each checked at its own end. */
   readonly tasks: readonly string[];
+  /** `NAME=CHECKPOINT` for each task checked at a checkpoint other than the end checkpoint. */
+  readonly taskEnds?: readonly string[] | undefined;
   /** Where the computer downloads the captured package file from, for an application installed from one. */
   readonly packageUrl?: string | undefined;
+  /** Packages installed beside the application, such as a runtime piece a build request named. */
+  readonly extraPackages?: readonly string[] | undefined;
+  /** A JSON file naming the AppImage or tarball a build computer unpacked the application from. */
+  readonly downloadInstall?: string | undefined;
   /** The checkpoint the seed is taken at; the baseline when omitted. */
   readonly seedCheckpoint?: string | undefined;
-  /** The checkpoint a task's end state is read at; the last when omitted. */
+  /** The checkpoint a task's end state is read at unless it names its own; the last when omitted. */
   readonly endCheckpoint?: string | undefined;
   /** The seed was made for the task, as in a build computer, rather than taken from the user's own data. */
   readonly syntheticSeed?: boolean | undefined;
@@ -88,12 +110,14 @@ export interface DesktopExportResult {
   readonly unseeded_files: readonly string[];
   /** Seed files rewritten to remove the capture host's name and user. */
   readonly scrubbed_files: readonly string[];
+  /** gzip seed files compressed again only to clear their headers, their documents as captured. */
+  readonly recompressed_files: readonly string[];
   /** Seed files that still hold them, in bytes the export does not rewrite or in their name. */
   readonly unscrubbed_files: readonly string[];
   readonly dconf_groups: number;
   readonly files: readonly string[];
   readonly limitations: readonly string[];
-  readonly task: AdmittedTask["summary"] | null;
+  readonly tasks: readonly TaskSummary[];
 }
 
 const isRecord = (
@@ -146,20 +170,6 @@ const unseededFiles = (
   return [...new Set([...listed, ...omitted])].sort();
 };
 
-/** Files in the desktop Trash at the seed, which the state view never makes the app's, so the seed leaves them out. */
-const trashedFiles = (
-  files: ReadonlyMap<string, StatePath>,
-  seed: number,
-): readonly string[] =>
-  [...files]
-    .filter(
-      ([, path]) =>
-        path.reasons.includes("desktop_trash") &&
-        versionAt(path, seed)?.present === true,
-    )
-    .map(([home]) => home)
-    .sort();
-
 /** Decide the bundle from the capture and its state view at the seed, with each seed's digest. */
 const planExport = (
   request: DesktopExportRequest,
@@ -169,6 +179,7 @@ const planExport = (
     readonly evidenceId: string;
     readonly seed: number;
     readonly identity: HostIdentity;
+    readonly download: DownloadInstall | undefined;
   },
 ): {
   readonly plan: DesktopAppExportPlan;
@@ -181,22 +192,29 @@ const planExport = (
 } => {
   const { application, host } = capture;
   const source = exportEnvironmentName(capture, request.name);
-  const { install, windowClass } = admitApplication(
-    capture,
-    source,
-    request.packageUrl,
-  );
+  const { install, windowClass } = admitApplication(capture, source, {
+    ...request,
+    download: context.download,
+  });
   const electron = application.executable.electron_markers.length > 0;
-  const { homePath, files, collisions, paths } = exportedStateFiles(
-    capture,
-    state,
-  );
+  const stateFiles = exportedStateFiles(capture, state);
+  const { homePath, stateAliases, files, collisions, paths, isLeftOut } =
+    stateFiles;
   const { text: dconf, ...dconfScrub } = seedDconf(
     state,
     context.seed,
     context.identity,
   );
-  const { seeds, textSeeds } = seedVersions(files, paths, context.seed);
+  const { seeds, textSeeds, locks } = seedVersions(
+    files,
+    paths,
+    context.seed,
+    isLeftOut,
+  );
+  const unseeded = unseededFiles(capture, homePath, files, {
+    paths,
+    seed: context.seed,
+  });
   const launch = planLaunch(capture, electron, seeds, files);
   const plan: DesktopAppExportPlan = {
     name: source,
@@ -209,9 +227,13 @@ const planExport = (
     aptSources: install.sources,
     architectures: install.architectures,
     packageFile: install.packageFile,
+    ...(install.download === undefined ? {} : { download: install.download }),
     ...(install.executablePackage === undefined
       ? {}
       : { executablePackage: install.executablePackage }),
+    ...(install.extraPackages === undefined
+      ? {}
+      : { extraPackages: install.extraPackages }),
     electron,
     command: launch.command,
     opens: launch.opens,
@@ -222,18 +244,22 @@ const planExport = (
     syntheticSeed: request.syntheticSeed === true,
     seedFiles: [...seeds.keys()].sort(),
     textSeeds,
-    unseededFiles: unseededFiles(capture, homePath, files, {
-      paths,
-      seed: context.seed,
-    }),
+    seedModes: seedModes(capture, seeds, files, context.seed),
+    stateAliases,
+    unseededFiles: unseeded.filter((file) => !isLeftOut(file)),
+    leftOutLocks: [
+      ...new Set([...locks, ...unseeded.filter(isLeftOut)]),
+    ].sort(),
+    unownedFolders: unownedChangedFolders(files, paths, isLeftOut),
+    runtimeSeeds: runtimeSeeds([...seeds.keys()]),
     dconf,
     captureEvidenceId: context.evidenceId,
   };
-  const limitations = installLimitations(
-    install,
-    application.package,
-    electron,
-  );
+  const unreadDconf = unreadDconfLimitation(stateFiles.dconf, context.seed);
+  const limitations = [
+    ...installLimitations(install, application.package, electron),
+    ...(unreadDconf === undefined ? [] : [unreadDconf]),
+  ];
   return {
     plan,
     seeds,
@@ -245,6 +271,14 @@ const planExport = (
   };
 };
 
+/** The limitation naming files the desktop Trash held at the seed; none when it held none. */
+export const trashedFilesLimitation = (
+  files: readonly string[],
+): string | undefined =>
+  files.length === 0
+    ? undefined
+    : `The desktop Trash held ${String(files.length)} file(s) at the seed checkpoint, which are not seeded: ${files.map((home) => `~/${home}`).join(", ")}. Restore one the task needs and capture again.`;
+
 /** The limitation on where the seed came from: made for the task, or the user's real state, kept local. */
 export const seedLimitation = (syntheticSeed: boolean): string =>
   syntheticSeed
@@ -252,12 +286,12 @@ export const seedLimitation = (syntheticSeed: boolean): string =>
     : "The seed is the user's real state at the seed checkpoint; keep the bundle local.";
 
 const SCRUB_LIMITATION =
-  "Binary state files are seeded as captured; only text files, UTF-8 or UTF-16 with a byte-order mark, have the capture host's name, user@host and home path replaced.";
+  "Binary state files are seeded as captured; only text files, UTF-8 or UTF-16 with a byte-order mark, and gzip documents, scrubbed inside, have the capture host's name, user@host and home path replaced. A gzip document so rewritten is compressed again as one member with no extra field, so a BGZF or dictzip file loses the blocks its index names.";
 
 /** The bundle's generated files, the class module flagged when its dconf keys hold the identity, and its README, made once the seeds' scrub is known. */
 const bundleText = (
   plan: DesktopAppExportPlan,
-  admitted: AdmittedTask | undefined,
+  admitted: AdmittedTasks | undefined,
   dconfHoldsIdentity: boolean,
 ) => {
   const environment = `envs/${plan.name}`;
@@ -277,14 +311,9 @@ const bundleText = (
         dconfHoldsIdentity,
       ),
       text(`${environment}/SKILL.md`, renderSkill(plan)),
-      ...(plan.packageFile === null
-        ? []
-        : [
-            text(
-              `${environment}/${INSTALL_SCRIPT}`,
-              renderInstallScript(plan.packageFile),
-            ),
-          ]),
+      ...installFiles(plan).map(({ path, content }) =>
+        text(`${environment}/${path}`, content),
+      ),
       text("tasks/smoke.json", renderSmokeTask(plan)),
       ...(admitted?.files ?? []).map((file) => text(file.path, file.content)),
     ],
@@ -299,10 +328,22 @@ const exportLimitations = (
     readonly collisions: readonly HomePathCollision[];
     readonly identity: HostIdentity;
     readonly trashed: readonly string[];
+    readonly recovered: readonly string[];
+    /** What the export says about the task, such as a prompt that does not name the app. */
+    readonly task: readonly string[];
   },
 ): string[] => {
-  const opened = capture.state.unretained_opened_directories;
+  const opened = heldOpenLimitation(
+    capture.state.unretained_opened_directories,
+    capture.host.home,
+    plan.seedFiles,
+  );
   const opens = launchDocumentLimitation(plan.opens);
+  const unowned = unownedFoldersLimitation(plan.unownedFolders);
+  const runtime = runtimeSeedsLimitation(plan.runtimeSeeds);
+  const locks = leftOutLocksLimitation(plan.leftOutLocks);
+  const recovered = recoveryListLimitation(facts.recovered);
+  const trashed = trashedFilesLimitation(facts.trashed);
   return [
     seedLimitation(plan.syntheticSeed),
     SCRUB_LIMITATION,
@@ -313,25 +354,22 @@ const exportLimitations = (
       : [
           `${String(plan.unseededFiles.length)} file(s) under the owned paths existed at the seed but were not retained, so they are not seeded.`,
         ]),
-    ...(facts.trashed.length === 0
-      ? []
-      : [
-          `The desktop Trash held ${String(facts.trashed.length)} file(s) at the seed checkpoint, which are not seeded: ${facts.trashed.map((home) => `~/${home}`).join(", ")}. Restore one the task needs and capture again.`,
-        ]),
+    ...(locks === undefined ? [] : [locks]),
+    ...(recovered === undefined ? [] : [recovered]),
+    ...(unowned === undefined ? [] : [unowned]),
+    ...(runtime === undefined ? [] : [runtime]),
+    ...(trashed === undefined ? [] : [trashed]),
     ...(facts.identity.hostname === null || facts.identity.user === null
       ? [
           "The capture does not record the host's name and user, so only the captured home is removed from the seed; capture again to remove them too.",
         ]
       : []),
-    ...(opened.length === 0
-      ? []
-      : [
-          `The application held files open in ${opened.join(", ")}, whose starting content the capture did not retain, so nothing there is seeded.`,
-        ]),
+    ...(opened === undefined ? [] : [opened]),
     ...facts.collisions.map(
       ({ home, kept, dropped }) =>
         `${dropped} and ${kept} both map to ~/${home}; the export uses ${kept} and leaves out ${dropped}.`,
     ),
+    ...facts.task,
   ];
 };
 
@@ -366,6 +404,7 @@ const runExport = async (
       evidenceId: evidence.evidence_id,
       seed: ends.seed,
       identity,
+      download: await readDownloadInstall(request.downloadInstall),
     });
   const copies = retainedCopies(plan, seeds);
   // A task's seed checks read the seeds as the bundle ships them, scrubbed.
@@ -377,13 +416,25 @@ const runExport = async (
           (content) => shippedSeedViews(content, copies, identity, signal),
           SEED_MAX_BYTES,
         );
-  const admitted = await admitDesktopTask(
-    request.tasks,
-    { ...plan, files, identity, ends, seedViews },
+  const admitted = await admitDesktopTasks(
+    { paths: request.tasks, ends: request.taskEnds ?? [] },
+    {
+      ...plan,
+      files,
+      identity,
+      ends,
+      checkpoints,
+      seedViews,
+      seeded: new Set(seeds.keys()),
+    },
     signal,
   );
   const { generated, readme } = bundleText(plan, admitted, dconf.holdsIdentity);
-  let scrub: SeedScrubReport = { scrubbed: [], unscrubbed: [] };
+  let scrub: SeedScrubReport = {
+    scrubbed: [],
+    recompressed: [],
+    unscrubbed: [],
+  };
   const unclosed = await withRetainedContent(
     request.capture,
     (content) =>
@@ -403,6 +454,8 @@ const runExport = async (
     collisions,
     identity,
     trashed,
+    recovered: scrub.recovered ?? [],
+    task: admitted?.limitations ?? [],
   });
   const result: DesktopExportResult = {
     directory: request.directory,
@@ -416,6 +469,7 @@ const runExport = async (
     seed_files: plan.seedFiles,
     unseeded_files: plan.unseededFiles,
     scrubbed_files: [...scrub.scrubbed].sort(),
+    recompressed_files: [...scrub.recompressed].sort(),
     unscrubbed_files: [...scrub.unscrubbed].sort(),
     dconf_groups: dconf.groups,
     files: [
@@ -424,7 +478,7 @@ const runExport = async (
       ...copies.map((copy) => copy.path),
     ],
     limitations,
-    task: admitted?.summary ?? null,
+    tasks: admitted?.summaries ?? [],
   };
   return { result, captureEvidenceId: evidence.evidence_id, unclosed };
 };
@@ -448,7 +502,10 @@ export const exportDesktopApplication = async (
         capture_evidence_id: captureEvidenceId,
         named: request.name !== undefined,
         tasks: request.tasks.length,
+        task_ends: [...(request.taskEnds ?? [])],
         package_url: request.packageUrl !== undefined,
+        download_install: request.downloadInstall !== undefined,
+        extra_packages: [...(request.extraPackages ?? [])],
         seed_checkpoint: request.seedCheckpoint ?? null,
         end_checkpoint: request.endCheckpoint ?? null,
         synthetic_seed: request.syntheticSeed === true,
@@ -460,6 +517,7 @@ export const exportDesktopApplication = async (
         seed_files: [...result.seed_files],
         unseeded_files: [...result.unseeded_files],
         scrubbed_files: [...result.scrubbed_files],
+        recompressed_files: [...result.recompressed_files],
         unscrubbed_files: [...result.unscrubbed_files],
         files: [...result.files],
         limitations: [...result.limitations],

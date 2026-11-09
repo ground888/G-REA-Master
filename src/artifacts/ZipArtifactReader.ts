@@ -152,6 +152,7 @@ class NodeFileReader extends Reader<string> {
       throw new ArtifactReaderFailure(
         "limit",
         `ZIP metadata read requires ${readBytes} bytes, exceeding the ${this.maximumReadBytes}-byte read budget`,
+        { boundary: "capacity" },
       );
     const bytes = await readFileHandleRange(handle, index, readBytes);
     if (bytes.length !== readBytes)
@@ -226,6 +227,7 @@ export class ZipArtifactReader implements ArtifactReader {
             throw new ArtifactReaderFailure(
               "limit",
               `ZIP entries declare ${String(declaredFileBytes)} uncompressed bytes, exceeding this archive's ${String(budget)}-byte decompression budget (${String(MINIMUM_ARTIFACT_EXPANDED_BYTES)}-byte minimum, ${String(ARTIFACT_EXPANSION_RATIO)}x archive size); a small archive cannot expand this far`,
+              { boundary: "capacity" },
             );
         }
         const stored = this.#entries.get(metadata.adapterKey);
@@ -346,6 +348,7 @@ const projectZipEntry = (
   // Root directory markers carry no inventory occurrence. A file with this
   // spelling is still passed to the shared path validator and rejected there.
   if (kind === "directory" && (path === "" || path === ".")) return undefined;
+  const legacyNames = legacyNameLimitations(entry);
   return {
     path,
     ...(path === sourcePath ? {} : { sourcePath }),
@@ -364,8 +367,11 @@ const projectZipEntry = (
         : [
             `ZIP member name ${JSON.stringify(sourcePath)} has a leading current-directory prefix omitted from its logical path.`,
           ]),
-      ...legacyNameLimitations(entry),
+      ...legacyNames,
     ],
+    // A CP437 fallback name is a guess at the stored bytes, so the logical path
+    // is a projection of it rather than a verified spelling.
+    ...(legacyNames.length === 0 ? {} : { nameVerified: false }),
     adapterKey: `zip-entry:${index}`,
   };
 };

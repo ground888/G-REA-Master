@@ -4,6 +4,7 @@ import { Readable } from "node:stream";
 
 import { AnalysisError } from "../../domain/analysisErrorBase.js";
 import type { DesktopTask } from "../../domain/desktop/appTask.js";
+import { isScreenTask } from "../../domain/desktop/appTaskScreen.js";
 import type {
   WitnessStage,
   WitnessStageRecord,
@@ -213,6 +214,38 @@ const logLimitations = (
     : []),
 ];
 
+/** Which stages graded files that had not settled by the bound, and which of them had a read cut there. */
+const unsettledLimitation = (
+  stages: readonly WitnessStageRecord[],
+): string[] => {
+  const named = (cut: boolean) =>
+    stages.flatMap(({ stage, settled, read_cut }) =>
+      settled || (cut && !read_cut) ? [] : [stage],
+    );
+  const [unsettled, cut] = [named(false), named(true)];
+  return [
+    ...(unsettled.length === 0
+      ? []
+      : [
+          `The app's files had not held for the settle window by its bound when these stages were checked, so each graded its last completed read, with settled false: ${unsettled.join(", ")}.`,
+        ]),
+    ...(cut.length === 0
+      ? []
+      : [
+          `A read still running at the settle bound was cut, with read_cut true, in: ${cut.join(", ")}.`,
+        ]),
+  ];
+};
+
+/** How the witness reached its check results, by the kind of task. */
+const howChecked = (task: DesktopTask): string => {
+  if (isScreenTask(task))
+    return "Checks took a screenshot of the computer and ran the bundle's own verifier as its judge, with the agentenv runner's Python and model endpoint, three votes a question; the judge sent each screenshot and the build's two examples to that model.";
+  return task.readers === undefined
+    ? "Checks read the app's data/get views with REA's evaluator, as the exported verifier does; the verifier itself did not run."
+    : "Checks read the app's data/get views and the task's readers' views, the readers run in the computer through computer-exec/v1, with REA's evaluator, as the exported verifier does; the verifier itself did not run.";
+};
+
 /** How a witness write ended: saved, retryable, or published with cleanup still open. */
 export type WitnessWrite =
   | { readonly kind: "saved"; readonly record: WitnessRecord }
@@ -281,11 +314,12 @@ export const writeWitnessRecord = async (
     confidence: "observed",
     authority: "controlled-replay",
     limitations: [
-      "Checks read the app's data/get views with REA's evaluator, as the exported verifier does; the verifier itself did not run.",
+      howChecked(witness.task),
       ...("error" in recording
         ? [`The recording is missing: ${recording.error}`]
         : []),
       ...logLimitations(actions, dropped),
+      ...unsettledLimitation(witness.stages),
     ],
   });
   const files = [

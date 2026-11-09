@@ -89,8 +89,11 @@ const addBrowserWindow = (
     ),
     observations: [
       {
-        label: `BrowserWindow@${javascriptSourceRangeKey(value.location)}`,
+        label: `${value.window_constructor ?? "BrowserWindow"}@${javascriptSourceRangeKey(value.location)}`,
         properties: {
+          ...(value.window_constructor === undefined
+            ? {}
+            : { window_constructor: value.window_constructor }),
           source_path: file.path,
           options_status: value.options_status,
           web_preferences_status: value.web_preferences_status,

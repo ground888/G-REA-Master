@@ -23,7 +23,10 @@ import {
   expandJavaScriptInvocationArguments,
   resolveJavaScriptIntrinsicInvocation,
 } from "./javascriptIntrinsicInvocation.js";
-import { SemanticPropertyPathCoverage } from "./javascriptSemanticPropertyPaths.js";
+import {
+  SemanticPropertyPathCoverage,
+  type JavaScriptSemanticPropertyPath,
+} from "./javascriptSemanticPropertyPaths.js";
 import {
   readExactJavaScriptLiteral,
   runtimeFunctionParameters,
@@ -135,7 +138,7 @@ export const createSemanticModuleInterop = (
         const { root, members } = electronMemberPath(current);
         if (members.some((member) => member === null)) return finish(undefined);
         suffix = [...(members as readonly string[]), ...suffix];
-        for (const global of ["Object", "Function", "Reflect"])
+        for (const global of ["Object", "Function", "Reflect", "Array"])
           if (isUnshadowedGlobal(root, state, global))
             return finish(["intrinsic", global, ...suffix]);
         for (const global of ["globalThis", "global", "window", "self"])
@@ -732,7 +735,7 @@ export const createSemanticModuleInterop = (
     staticString,
     isFreshObject,
     opaqueMutationPath,
-    retainWrite: (node: t.Node, path: readonly (string | null)[]) => {
+    retainWrite: (node: t.Node, path: JavaScriptSemanticPropertyPath) => {
       const coverage = new SemanticPropertyPathCoverage();
       coverage.retain(path[0] === "opaque-intrinsic" ? ["intrinsic"] : path);
       writes.push({

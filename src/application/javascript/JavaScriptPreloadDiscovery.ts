@@ -11,7 +11,9 @@ import type { JavaScriptArtifactFileSet } from "../../domain/javascript/javascri
 import type { JavaScriptSourceAnalysisLimits } from "../../domain/javascript/javascriptSourceAnalysis.js";
 import type { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
 import { createJavaScriptSourceAnalysis } from "../../artifacts/javascript/JavaScriptSourceAnalysis.js";
+import { maySourceConstructElectronBrowserWindow } from "../../domain/javascript/javascriptStaticAnalysis.js";
 import { createJavaScriptPackageTypeLookup } from "./JavaScriptArtifactAnalysis.js";
+import { dependencyManifest } from "./JavaScriptArtifactGraphContext.js";
 import { JavaScriptJsonDocuments } from "./JavaScriptJsonDocuments.js";
 import { resolveArtifactPathByContext } from "./JavaScriptArtifactPathResolution.js";
 
@@ -38,20 +40,50 @@ export const discoverJavaScriptPreloadPaths = async (
     fileSet,
     jsonDocuments,
   );
-  if (
-    !fileSet.files.some(
-      (file) =>
-        file.kind === "javascript" &&
-        file.text.included &&
-        posix.extname(file.path) === ".js" &&
-        packageTypeFor(file) === "module",
-    )
-  )
-    return { paths, limitations };
-  const sources = fileSet.files.filter(
-    (file) => file.kind === "javascript" && file.text.included,
+  const moduleJsContainers = new Set(
+    fileSet.files.flatMap((file) =>
+      file.kind === "javascript" &&
+      file.text.included &&
+      posix.extname(file.path) === ".js" &&
+      packageTypeFor(file) === "module"
+        ? [file.container_sha256]
+        : [],
+    ),
   );
-  const files = new Map(fileSet.files.map((file) => [file.path, file]));
+  if (moduleJsContainers.size === 0) return { paths, limitations };
+  const candidateContainers = new Set(
+    fileSet.files.flatMap((file) =>
+      file.kind === "javascript" &&
+      file.text.included &&
+      moduleJsContainers.has(file.container_sha256) &&
+      maySourceConstructElectronBrowserWindow(file.text.value)
+        ? [file.container_sha256]
+        : [],
+    ),
+  );
+  if (candidateContainers.size === 0) return { paths, limitations };
+  const sources = fileSet.files.filter(
+    (file) =>
+      file.kind === "javascript" &&
+      file.text.included &&
+      candidateContainers.has(file.container_sha256) &&
+      (!dependencyManifest(file.path) ||
+        maySourceConstructElectronBrowserWindow(file.text.value)),
+  );
+  if (sources.length === 0) return { paths, limitations };
+  const filesByContainer = new Map<
+    string,
+    Map<string, (typeof fileSet.files)[number]>
+  >();
+  for (const file of fileSet.files) {
+    if (!candidateContainers.has(file.container_sha256)) continue;
+    let containerFiles = filesByContainer.get(file.container_sha256);
+    if (containerFiles === undefined) {
+      containerFiles = new Map();
+      filesByContainer.set(file.container_sha256, containerFiles);
+    }
+    containerFiles.set(file.path, file);
+  }
   const worker = await createJavaScriptSourceAnalysis(limits, sources.length, {
     scope,
   });
@@ -88,6 +120,7 @@ export const discoverJavaScriptPreloadPaths = async (
         if (skipped) continue;
         break;
       }
+      const files = filesByContainer.get(file.container_sha256) ?? new Map();
       for (const window of result.value.javascript.electron.browser_windows) {
         if (
           window.preload_path === null ||

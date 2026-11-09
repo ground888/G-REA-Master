@@ -1,4 +1,4 @@
-import { chmod, mkdir, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -194,10 +194,282 @@ describe.skipIf(process.platform === "win32")("inspectLinuxApplication", () => {
   });
 });
 
+describe.skipIf(process.platform === "win32")(
+  "inspectLinuxApplication desktop file ids",
+  () => {
+    it("resolves a nested entry by its desktop file id before a lower-priority flat one", async () => {
+      const { home, environment } = await fixture();
+      const share = environment.XDG_DATA_DIRS;
+      await mkdir(join(home, ".local/share/applications/vendor"), {
+        recursive: true,
+      });
+      await writeFile(
+        join(
+          home,
+          ".local/share/applications/vendor/org.example.nested.desktop",
+        ),
+        "[Desktop Entry]\nType=Application\nName=High\nExec=notes-app --high\n",
+      );
+      // The spec's id for the nested entry above, installed at lower priority.
+      await writeFile(
+        join(share, "applications/vendor-org.example.nested.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Low\nExec=notes-app --low\n",
+      );
+
+      const inventory = await inventoryOf("vendor-org.example.nested", {
+        home,
+        environment,
+      });
+
+      expect(inventory.desktop_entry).toMatchObject({
+        id: "vendor-org.example.nested",
+        name: "High",
+      });
+      expect(inventory.argv).toEqual(["notes-app", "--high"]);
+    });
+
+    it("resolves an id whose directory name itself contains a dash", async () => {
+      const { home, environment } = await fixture();
+      const directory = join(home, ".local/share/applications/org.example");
+      await mkdir(directory, { recursive: true });
+      await writeFile(
+        join(directory, "my-app.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Dashed\nExec=notes-app\n",
+      );
+
+      const inventory = await inventoryOf("org.example-my-app", {
+        home,
+        environment,
+      });
+
+      expect(inventory.desktop_entry).toMatchObject({
+        id: "org.example-my-app",
+        name: "Dashed",
+      });
+    });
+
+    it("refuses rather than launch a lower-priority entry when a subtree cannot be listed", async () => {
+      const { home, environment } = await fixture();
+      const share = environment.XDG_DATA_DIRS;
+      const applications = join(home, ".local/share/applications");
+      const vendor = join(applications, "vendor");
+      await mkdir(vendor, { recursive: true });
+      await writeFile(
+        join(vendor, "org.example.app.desktop"),
+        "[Desktop Entry]\nType=Application\nName=High\nExec=notes-app --high\n",
+      );
+      await writeFile(
+        join(share, "applications/vendor-org.example.app.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Low\nExec=notes-app --low\n",
+      );
+      // The readable file above is not enough: the subtree that holds the
+      // higher-priority entry has to be listable before absence is trusted.
+      await chmod(vendor, 0o000);
+
+      try {
+        const inspected = await inspectLinuxApplication({
+          desktopEntry: "vendor-org.example.app",
+          executable: undefined,
+          arguments: [],
+          environment,
+          home,
+          callerDirectory: home,
+        });
+
+        // Root ignores the mode bits, so the directory stays listable and the
+        // scenario this asserts cannot be built.
+        if (inspected.ok) expect(process.getuid?.()).toBe(0);
+        else
+          expect(inspected.error.reason).toBe(
+            "desktop_entry_search_incomplete",
+          );
+      } finally {
+        await chmod(vendor, 0o755);
+      }
+    });
+  },
+);
+
+describe.skipIf(process.platform === "win32")(
+  "unresolved desktop entry link targets",
+  () => {
+    it
+      .skipIf(process.getuid?.() === 0)
+      .each(["directory", "flat-file", "nested-file"] as const)(
+      "refuses a lower-priority entry when a %s link target cannot be examined",
+      async (kind) => {
+        const { home, environment } = await fixture();
+        const applications = join(home, ".local/share/applications");
+        const blocked = join(home, "blocked");
+        const target = join(blocked, "vendor");
+        await mkdir(target, { recursive: true });
+        await mkdir(applications, { recursive: true });
+        await writeFile(
+          join(target, "app.desktop"),
+          "[Desktop Entry]\nType=Application\nName=High\nExec=notes-app\n",
+        );
+        await writeFile(
+          join(environment.XDG_DATA_DIRS, "applications/vendor-app.desktop"),
+          "[Desktop Entry]\nType=Application\nName=Low\nExec=notes-app\n",
+        );
+        let link: string;
+        if (kind === "directory") {
+          link = join(applications, "vendor");
+          await symlink(target, link);
+        } else {
+          if (kind === "nested-file") await mkdir(join(applications, "vendor"));
+          link = join(
+            applications,
+            kind === "flat-file" ? "vendor-app.desktop" : "vendor/app.desktop",
+          );
+          await symlink(join(target, "app.desktop"), link);
+        }
+        await chmod(blocked, 0o000);
+        try {
+          const probe = await stat(link).then(
+            () => undefined,
+            (cause: unknown) => cause,
+          );
+          expect(probe).toMatchObject({ code: "EACCES" });
+          const result = await inspectLinuxApplication({
+            desktopEntry: "vendor-app",
+            executable: undefined,
+            arguments: [],
+            environment,
+            home,
+            callerDirectory: home,
+          });
+          expect(result).toMatchObject({
+            ok: false,
+            error: { reason: "desktop_entry_search_incomplete" },
+          });
+        } finally {
+          await chmod(blocked, 0o755);
+        }
+      },
+    );
+  },
+);
+
+describe.skipIf(process.platform === "win32")(
+  "remaining desktop file id controls",
+  () => {
+    it("finds the entry before reporting an unreachable sibling as incomplete", async () => {
+      const { home, environment } = await fixture();
+      const applications = join(home, ".local/share/applications");
+      const found = join(applications, "zz-vendor");
+      const unreadable = join(applications, "aa-vendor");
+      await mkdir(found, { recursive: true });
+      await mkdir(unreadable, { recursive: true });
+      await writeFile(
+        join(found, "org.example.app.desktop"),
+        "[Desktop Entry]\nType=Application\nName=High\nExec=notes-app\n",
+      );
+      await chmod(unreadable, 0o000);
+
+      try {
+        const inventory = await inventoryOf("zz-vendor-org.example.app", {
+          home,
+          environment,
+        });
+
+        // The sibling that cannot be listed may hold the entry too, but this
+        // root already answered, so the reachable answer is the one to use.
+        expect(inventory.desktop_entry).toMatchObject({
+          id: "zz-vendor-org.example.app",
+          name: "High",
+        });
+      } finally {
+        await chmod(unreadable, 0o755);
+      }
+    });
+
+    it("searches a directory whose own name ends in .desktop", async () => {
+      const { home, environment } = await fixture();
+      const directory = join(home, ".local/share/applications/vendor.desktop");
+      await mkdir(directory, { recursive: true });
+      await writeFile(
+        join(directory, "app.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Nested\nExec=notes-app\n",
+      );
+
+      const inventory = await inventoryOf("vendor.desktop-app", {
+        home,
+        environment,
+      });
+
+      expect(inventory.desktop_entry).toMatchObject({
+        id: "vendor.desktop-app",
+        name: "Nested",
+      });
+    });
+
+    it("keeps a dash inside a directory name, not only inside the file name", async () => {
+      const { home, environment } = await fixture();
+      const directory = join(
+        home,
+        ".local/share/applications/org.example-tools",
+      );
+      await mkdir(directory, { recursive: true });
+      await writeFile(
+        join(directory, "my-app.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Both\nExec=notes-app\n",
+      );
+
+      const inventory = await inventoryOf("org.example-tools-my-app", {
+        home,
+        environment,
+      });
+
+      expect(inventory.desktop_entry).toMatchObject({
+        id: "org.example-tools-my-app",
+        name: "Both",
+      });
+    });
+  },
+);
+
+describe.skipIf(process.platform === "win32")(
+  "inspectLinuxApplication incomplete desktop file searches",
+  () => {
+    it("refuses rather than launch a lower-priority entry when the search is cut short", async () => {
+      const { home, environment } = await fixture();
+      const share = environment.XDG_DATA_DIRS;
+      const applications = join(home, ".local/share/applications");
+      // More nested directories than the bounded search may enter.
+      for (let index = 0; index < 6; index += 1)
+        await mkdir(
+          join(applications, ...Array<string>(index + 1).fill("deep")),
+          { recursive: true },
+        );
+      await writeFile(
+        join(share, "applications/buried-org.example.app.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Low\nExec=notes-app\n",
+      );
+
+      const inspected = await inspectLinuxApplication({
+        desktopEntry: "buried-org.example.app",
+        executable: undefined,
+        arguments: [],
+        environment,
+        home,
+        callerDirectory: home,
+      });
+
+      expect(!inspected.ok && inspected.error.reason).toBe(
+        "desktop_entry_search_incomplete",
+      );
+    });
+  },
+);
+
 /** The inventory of an installed desktop entry, launched with no arguments. */
 const inventoryOf = async (
   desktopEntry: string,
-  { home, environment }: Awaited<ReturnType<typeof fixture>>,
+  {
+    home,
+    environment,
+  }: Pick<Awaited<ReturnType<typeof fixture>>, "home" | "environment">,
 ) => {
   const inspected = await inspectLinuxApplication({
     desktopEntry,

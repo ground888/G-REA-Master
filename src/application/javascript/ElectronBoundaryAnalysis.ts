@@ -188,7 +188,8 @@ export const electronBoundaryFactCount = (
           javascript.electron.native_addon_bindings.filter(
             provenElectronFinding,
           ).length +
-          javascript.electron.protocols.filter(provenElectronFinding).length),
+          javascript.electron.protocols.filter(provenElectronFinding).length +
+          (javascript.electron.dynamic_code ?? []).length),
     0,
   );
 
@@ -347,6 +348,14 @@ export const summarizeElectronBoundaries = (
         }),
     ).length,
     native_addon_bindings: nativeBindings.length,
+    v8_cached_data_executions: javascript.reduce(
+      (count, { electron }) =>
+        count +
+        (electron.dynamic_code ?? []).filter(
+          ({ execution }) => execution === "cached-data",
+        ).length,
+      0,
+    ),
     resolved_native_addon_bindings: nativeBindings.filter(({ file, finding }) =>
       resolvesToFile({
         file,

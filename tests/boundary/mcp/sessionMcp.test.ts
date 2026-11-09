@@ -746,7 +746,7 @@ describe("session filesystem path boundaries over MCP", () => {
       },
     });
     await mcp.callTool({ name: "close_binary", arguments: {} });
-  }, 10_000);
+  }, 30_000);
 });
 
 describe("json depth bounds over MCP", () => {

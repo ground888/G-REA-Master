@@ -36,7 +36,7 @@ import { fixedAllowanceOptions } from "../domain/fixedAllowanceRemediation.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
-  readRustBinaryImage,
+  readRustBinaryImageAsync,
   type RustBinaryImage,
 } from "./RustBinaryImage.js";
 import { requireSelectedNativeImage } from "../native/metadata/MachoSliceSelection.js";
@@ -88,7 +88,11 @@ export class RustBinaryProvider implements RustBinaryPort {
           input.architecture,
         );
         const image = inFile(
-          readRustBinaryImage(selected.bytes),
+          await readRustBinaryImageAsync(selected.bytes, {
+            includeInferredCrates: input.include_inferred_crates === true,
+            maxInferredCrates: input.max_inferred_crates,
+            checkActive: () => assertArtifactReadActive(options?.signal),
+          }),
           selected.fileOffset,
         );
         const report = {
@@ -98,6 +102,12 @@ export class RustBinaryProvider implements RustBinaryPort {
           byte_order: image.byte_order,
           auditable_metadata: image.auditable_metadata,
           rustc_commit: image.rustc_commit,
+          ...(image.inferred_crates === undefined
+            ? {}
+            : { inferred_crates: image.inferred_crates }),
+          ...(image.rustc_versions === undefined
+            ? {}
+            : { rustc_versions: image.rustc_versions }),
           artifact: {
             path: input.path,
             sha256: snapshot.sha256,
@@ -151,6 +161,28 @@ const inFile = (image: RustBinaryImage, fileOffset: number): RustBinaryImage =>
                   file_offset: entry.file_offset + fileOffset,
                 })),
               },
+        ...(image.inferred_crates === undefined
+          ? {}
+          : {
+              inferred_crates: {
+                ...image.inferred_crates,
+                items: image.inferred_crates.items.map((item) => ({
+                  ...item,
+                  first_file_offset: item.first_file_offset + fileOffset,
+                })),
+              },
+            }),
+        ...(image.rustc_versions === undefined
+          ? {}
+          : {
+              rustc_versions: {
+                ...image.rustc_versions,
+                items: image.rustc_versions.items.map((item) => ({
+                  ...item,
+                  first_file_offset: item.first_file_offset + fileOffset,
+                })),
+              },
+            }),
       };
 
 const outputLimit = (path: string) =>
@@ -166,11 +198,11 @@ const outputLimit = (path: string) =>
 export const RUST_RESOURCE_GUARD_LIMITATION =
   "Resource guards bound the selected file to 256 MiB, the compressed dependency stream to 1 MiB, inflated JSON to the smaller of 8 MiB and 64 times the consumed compressed-stream length, and the complete report to 8 MiB. Package and dependency counts are admitted against that output budget before schema cloning, graph objects, or reverse-edge allocation.";
 
-const limitationsFor = (
-  image: ReturnType<typeof readRustBinaryImage>,
-): string[] => [
+const limitationsFor = (image: RustBinaryImage): string[] => [
   "Embedded dependency metadata is file content. It does not authenticate package names, versions, sources, or the compiler that produced the binary.",
-  "Only the .dep-v0 dependency section and read-only compiler path strings are inspected. Functions, types, and runtime behavior are not recovered.",
+  image.inferred_crates === undefined
+    ? "Only the .dep-v0 dependency section and read-only compiler path strings are inspected. Functions, types, and runtime behavior are not recovered."
+    : "Only the .dep-v0 dependency section, read-only Cargo/rustc source-path strings, and ELF .comment toolchain banners are inspected. Functions, types, and runtime behavior are not recovered.",
   RUST_RESOURCE_GUARD_LIMITATION,
   ...(image.section_names_limitation === undefined
     ? []
@@ -200,6 +232,21 @@ const limitationsFor = (
       ]
     : []),
   ...rustcLimitation(image.rustc_commit),
+  ...(image.inferred_crates === undefined
+    ? []
+    : [
+        "Path-inferred Cargo crates and rustc version banners are recovered from read-only panic/debug source paths and ELF .comment strings (bounded to 64 MiB of candidate bytes). They do not represent a complete Cargo.lock dependency graph; crates without surviving path strings remain unobserved.",
+        ...(image.inferred_crates.truncated
+          ? [
+              "Recovered inferred_crates were truncated at the configured item limit or 64 MiB read-only scan budget; additional Cargo crate path strings may exist.",
+            ]
+          : []),
+        ...(image.rustc_versions?.truncated === true
+          ? [
+              "Recovered rustc_versions were truncated at the 64-banner limit or 64 MiB read-only scan budget; additional toolchain banners may exist.",
+            ]
+          : []),
+      ]),
 ];
 
 const unknownFormatLimitation = (
@@ -216,9 +263,7 @@ const unknownFormatLimitation = (
   ];
 };
 
-const rustcLimitation = (
-  commit: ReturnType<typeof readRustBinaryImage>["rustc_commit"],
-): string[] => {
+const rustcLimitation = (commit: RustBinaryImage["rustc_commit"]): string[] => {
   if (commit === null)
     return [
       "No /rustc/<40-hex>/ path was found in read-only data, so a rustc commit hash is unknown.",

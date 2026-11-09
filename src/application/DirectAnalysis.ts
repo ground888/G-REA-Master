@@ -154,6 +154,7 @@ export const runDirectAnalysis = async (
     readonly formatHint?: ExecutableFormatHint;
     readonly architecture?: BinaryArchitecture;
     readonly entryPoint?: string;
+    readonly dsymPath?: string;
     readonly espFlash?: EspFlashSelection;
     readonly includeEvidenceSources?: boolean;
   } = {},
@@ -184,6 +185,7 @@ const targetSelection = (options: {
   readonly formatHint?: ExecutableFormatHint;
   readonly architecture?: BinaryArchitecture;
   readonly entryPoint?: string;
+  readonly dsymPath?: string;
   readonly espFlash?: EspFlashSelection;
 }) => ({
   ...(options.formatHint === undefined
@@ -195,6 +197,7 @@ const targetSelection = (options: {
   ...(options.entryPoint === undefined
     ? {}
     : { entryPoint: options.entryPoint }),
+  ...(options.dsymPath === undefined ? {} : { dsymPath: options.dsymPath }),
   ...(options.espFlash === undefined ? {} : { espFlash: options.espFlash }),
 });
 
@@ -403,6 +406,7 @@ const runAnalysis = async (
     readonly formatHint?: ExecutableFormatHint;
     readonly architecture?: BinaryArchitecture;
     readonly entryPoint?: string;
+    readonly dsymPath?: string;
     readonly espFlash?: EspFlashSelection;
   },
 ): Promise<AnalysisResultWithSources<Evidence, JsonValue>> => {
@@ -877,6 +881,7 @@ const prepareSnapshot = async (options: {
   readonly formatHint?: ExecutableFormatHint;
   readonly architecture?: BinaryArchitecture;
   readonly entryPoint?: string;
+  readonly dsymPath?: string;
   readonly espFlash?: EspFlashSelection;
   readonly snapshotPath: string | undefined;
   readonly signal: AbortSignal;

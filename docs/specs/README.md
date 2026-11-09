@@ -15,3 +15,5 @@ for the specification lifecycle, roadmap granularity and producer-owned contract
 
 - [Go static string-header literal recovery](native/go-string-literals/spec.md)
   ([plan](native/go-string-literals/plan.md), [tasks](native/go-string-literals/tasks.md))
+- [Mach-O dSYM companion admission](native/macho-dsym-companion/spec.md)
+  ([plan](native/macho-dsym-companion/plan.md), [tasks](native/macho-dsym-companion/tasks.md))
